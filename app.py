@@ -155,11 +155,12 @@ with st.sidebar:
     # 风格选择
     st.subheader("选择风格")
     style_id = st.radio(
-        "模板风格",
+        "风格",
         options=list(STYLE_CATEGORIES.keys()),
         format_func=lambda x: f"{STYLE_CATEGORIES[x]['name']}  —  {STYLE_CATEGORIES[x]['desc']}",
         index=0,
         horizontal=False,
+        label_visibility="collapsed",
     )
 
     # 显示风格预览色
@@ -172,7 +173,7 @@ with st.sidebar:
     ]
     for i, (name, color) in enumerate(zip(color_names, color_values)):
         with cols[i]:
-            hex_color = f"#{color.red:02x}{color.green:02x}{color.blue:02x}"
+            hex_color = f"#{str(color)[0:2]}{str(color)[2:4]}{str(color)[4:6]}"
             st.markdown(
                 f'<div style="width:36px;height:36px;border-radius:6px;'
                 f'background:{hex_color};margin:0 auto;border:1px solid #ddd;"></div>'
