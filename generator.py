@@ -25,6 +25,9 @@ from image_search import UnsplashSearcher, translate_keywords
 MARGIN = Cm(1.5)
 IMAGE_FRACTION = 0.45
 
+# EMU 单位换算: 1 inch = 914400 EMU, 1 cm = 360000 EMU
+EMU_PER_CM = 360000
+
 
 def create_presentation(
     slides: List[SlideContent],
@@ -71,7 +74,7 @@ def create_presentation(
             _add_page_number(slide, idx, len(slides), theme)
 
     if enable_images and searcher:
-        _insert_images(prs, slides, searcher, theme)
+        _insert_images_builtin(prs, slides, searcher, theme)
 
     return prs
 
@@ -92,13 +95,6 @@ def _create_from_template(
 
     核心原则：保留模板的一切视觉元素（背景、图片、装饰、校徽等），
     只修改文本框中的文字内容。
-
-    逻辑：
-    1. 分析模板中每个slide的类型，找到cover/toc/section/content/end模板
-    2. 根据解析内容构建slide计划（自动为H2内容插入section分隔页）
-    3. 创建新Presentation，按计划从模板克隆slide
-    4. 对每个克隆的slide替换文本
-    5. 添加页码和可选配图
     """
     import copy
 
@@ -119,8 +115,7 @@ def _create_from_template(
     content_list = [s for s in template_slides_info if s["type"] == "content"]
     end_list = [s for s in template_slides_info if s["type"] == "end"]
 
-    # 筛选section模板：优先使用含有"PART"字样的正规章节分隔页，
-    # 排除像"评分细则"这样的特殊页面
+    # 筛选section模板：优先使用含有"PART"字样的正规章节分隔页
     part_sections = []
     for s in section_list:
         tslide = template_prs.slides[s["index"]]
@@ -143,7 +138,7 @@ def _create_from_template(
     if not end_list:
         end_list = cover_list
 
-    # ── 步骤3: 收集所有章节名称（用于侧边目录和目录页） ──
+    # ── 步骤3: 收集所有章节名称 ──
     all_section_names = []
     section_num = 0
     for sd in slides:
@@ -155,7 +150,7 @@ def _create_from_template(
                 section_num += 1
                 all_section_names.append(sd.title)
 
-    # ── 步骤4: 构建slide计划（自动为H2内容添加section分隔页） ──
+    # ── 步骤4: 构建slide计划 ──
     slide_plan = []  # [(type, data, tmpl_idx, section_num)]
     section_num = 0
     last_was_section = False
@@ -174,7 +169,6 @@ def _create_from_template(
         elif layout == "end":
             slide_plan.append(("end", sd, end_list[0]["index"], section_num))
         else:
-            # Content: 自动添加section分隔页（H2内容前面没有section时）
             if sd.level <= 1 and not last_was_section:
                 section_num += 1
                 section_sd = SlideContent(layout="section", title=sd.title, level=1)
@@ -191,7 +185,6 @@ def _create_from_template(
     for slide_type, data, tmpl_idx, sec_num in slide_plan:
         source_slide = template_prs.slides[tmpl_idx]
         new_slide = _clone_slide(new_prs, source_slide, template_prs)
-        # 根据类型替换文本
         if slide_type == "cover":
             _replace_cover_text(new_slide, data, theme)
         elif slide_type == "toc":
@@ -199,33 +192,42 @@ def _create_from_template(
         elif slide_type == "section":
             _replace_section_text(new_slide, data, theme, sec_num)
         elif slide_type == "content":
-            _replace_content_text(new_slide, data, theme, all_section_names, sec_num)
+            _replace_content_text(new_slide, data, theme, all_section_names, sec_num, sw, sh)
         elif slide_type == "end":
             _replace_end_text(new_slide, data, theme)
 
-    # ── 步骤6: 添加页码 ──
+    # ── 步骤6: 添加页码（动态定位到右下角）──
+    sw_cm = sw / EMU_PER_CM
+    sh_cm = sh / EMU_PER_CM
     for i, (slide_type, _, _, _) in enumerate(slide_plan):
         if slide_type in ("content", "section"):
             slide = new_prs.slides[i]
+            pn_left = int((sw_cm - 2.5) * EMU_PER_CM)
+            pn_top = int((sh_cm - 0.8) * EMU_PER_CM)
             page_num_box = slide.shapes.add_textbox(
-                int(Cm(10.2)), int(Cm(7.0)), int(Cm(3.0)), int(Cm(0.4))
+                pn_left, pn_top, int(Cm(2.0)), int(Cm(0.5))
             )
             p = page_num_box.text_frame.paragraphs[0]
             p.text = str(i + 1)
             p.font.size = Pt(12)
             p.font.color.rgb = RGBColor(0x66, 0x66, 0x66)
             p.font.name = "微软雅黑"
+            p.alignment = PP_ALIGN.RIGHT
 
-    # ── 步骤7: 插入配图 ──
+    # ── 步骤7: 插入配图（模板专用，使用slide_plan正确映射索引）──
     if enable_images and unsplash_key:
         searcher = UnsplashSearcher(unsplash_key)
-        _insert_images(new_prs, slides, searcher, theme)
+        _insert_images_template(new_prs, slide_plan, searcher, theme, sw, sh)
 
     return new_prs
 
 
+# ══════════════════════════════════════════════════════════════
+#  模板文本替换函数
+# ══════════════════════════════════════════════════════════════
+
 def _collect_text_shapes(slide):
-    """收集slide中所有有文本的shape信息"""
+    """收集slide中所有有文本的shape信息（位置单位为英寸，与python-pptx内部一致）"""
     text_shapes = []
     for shape in slide.shapes:
         if not shape.has_text_frame:
@@ -240,7 +242,9 @@ def _collect_text_shapes(slide):
                 if run.font.size:
                     max_font = max(max_font, run.font.size.pt)
 
-        left_cm = shape.left / 914400
+        # 使用英寸作为位置单位（python-pptx内部 EMU/914400 = 英寸）
+        left_in = shape.left / 914400
+        top_in = shape.top / 914400
 
         text_shapes.append({
             "shape": shape,
@@ -248,7 +252,10 @@ def _collect_text_shapes(slide):
             "font_size": max_font,
             "top": shape.top,
             "left": shape.left,
-            "left_cm": left_cm,
+            "left_in": left_in,
+            "top_in": top_in,
+            "width": shape.width,
+            "height": shape.height,
         })
     return text_shapes
 
@@ -270,17 +277,14 @@ def _replace_toc_text(slide, data: SlideContent, theme: dict,
                        all_section_names: list):
     """目录页：小号文本(22pt)→章节名称，大号编号和"目录"保留"""
     text_shapes = _collect_text_shapes(slide)
-    # 按位置排序：小号文本在前（用于填目录项），大号编号保留
     sorted_shapes = sorted(text_shapes, key=lambda x: (x["font_size"] > 40, x["top"], x["left"]))
 
     toc_items = all_section_names if all_section_names else (data.bullet_items if data.bullet_items else [])
     toc_idx = 0
     for ts in sorted_shapes:
         if ts["font_size"] > 40:
-            # 大号编号(01-04)和"目录"/"CONTENTS"，保留
             continue
         else:
-            # 小号文本→目录标题
             if toc_idx < len(toc_items):
                 _set_shape_text(ts["shape"], toc_items[toc_idx])
                 toc_idx += 1
@@ -299,13 +303,10 @@ def _replace_section_text(slide, data: SlideContent, theme: dict,
 
     for i, ts in enumerate(sorted_shapes):
         if i == 0:
-            # 最大字号→章节编号
             _set_shape_text(ts["shape"], num_str)
         elif i == 1:
-            # 次大字号→章节标题（编号+名称）
             _set_shape_text(ts["shape"], section_title)
         else:
-            # 保留含"PART"的文本，清空其余多余文本
             if "part" in ts["text"].lower():
                 pass
             else:
@@ -313,12 +314,13 @@ def _replace_section_text(slide, data: SlideContent, theme: dict,
 
 
 def _replace_content_text(slide, data: SlideContent, theme: dict,
-                           all_section_names: list, section_num: int):
-    """正文内容页：侧边→章节名，标题→内容标题，添加正文文本框"""
+                           all_section_names: list, section_num: int,
+                           sw: int = 0, sh: int = 0):
+    """正文内容页：侧边→章节名，标题→内容标题，动态计算正文文本框填满页面"""
     text_shapes = _collect_text_shapes(slide)
-    # 分成两组：左侧(0-2cm)是侧边目录，右侧(2.2cm+)是正文区
-    sidebar_shapes = [ts for ts in text_shapes if ts["left_cm"] < 2.0]
-    content_shapes = [ts for ts in text_shapes if ts["left_cm"] >= 2.0]
+    # 侧边目录（left < 2英寸 ≈ 5cm）
+    sidebar_shapes = [ts for ts in text_shapes if ts["left_in"] < 2.0]
+    content_shapes = [ts for ts in text_shapes if ts["left_in"] >= 2.0]
 
     # 侧边目录：填入各章节名
     sidebar_sorted = sorted(sidebar_shapes, key=lambda x: x["top"])
@@ -328,7 +330,7 @@ def _replace_content_text(slide, data: SlideContent, theme: dict,
         else:
             _set_shape_text(ts["shape"], "")
 
-    # 正文区：最大→标题，其余清空（正文用新增文本框）
+    # 正文区：最大→标题，其余清空
     content_sorted = sorted(content_shapes, key=lambda x: -x["font_size"])
     for i, ts in enumerate(content_sorted):
         if i == 0:
@@ -336,25 +338,70 @@ def _replace_content_text(slide, data: SlideContent, theme: dict,
         else:
             _set_shape_text(ts["shape"], "")
 
-    # 添加正文文本框（18pt，10.5x5.6cm，位于left 2.2cm, top 1.2cm）
+    # ── 动态计算正文文本框位置和大小，填满可用区域 ──
     items = data.body_lines if data.body_lines else data.bullet_items
-    if items:
-        txBox = slide.shapes.add_textbox(
-            int(Cm(2.2)), int(Cm(1.2)),
-            int(Cm(10.5)), int(Cm(5.6))
-        )
-        tf = txBox.text_frame
-        tf.word_wrap = True
-        for i, item in enumerate(items):
-            if i == 0:
-                p = tf.paragraphs[0]
-            else:
-                p = tf.add_paragraph()
-            p.text = item
-            p.font.size = Pt(18)
-            p.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
-            p.font.name = "微软雅黑"
-            p.space_after = Pt(6)
+    if not items:
+        return
+
+    # 判断是否有配图（有keywords时预留右侧空间）
+    has_image = bool(data.keywords and len(data.keywords) > 0)
+
+    if sw > 0 and sh > 0 and content_sorted:
+        # 获取标题shape的实际位置来计算正文区域
+        title_shape = content_sorted[0]["shape"]
+        title_left = title_shape.left
+        title_top = title_shape.top
+        title_bottom = title_top + title_shape.height
+
+        # 正文起始：标题下方留0.3cm间距
+        body_left = title_left
+        body_top = title_bottom + int(Cm(0.3))
+
+        # 正文宽度：如果有图片则约占50%宽度，否则填满右侧
+        if has_image:
+            body_width = int(sw * 0.48)
+        else:
+            body_width = sw - body_left - int(Cm(1.0))
+
+        # 正文高度：从标题下方到距底部1.5cm（给页码留空间）
+        body_height = sh - body_top - int(Cm(1.5))
+
+        # 安全检查：确保尺寸合理
+        if body_width < int(Cm(3.0)):
+            body_width = int(Cm(3.0))
+        if body_height < int(Cm(2.0)):
+            body_height = int(Cm(2.0))
+    else:
+        # 兜底默认值
+        body_left = int(Cm(5.6))
+        body_top = int(Cm(3.0))
+        body_width = int(Cm(20.0)) if not has_image else int(Cm(14.0))
+        body_height = int(Cm(13.0))
+
+    # 根据内容量自适应字号
+    total_chars = sum(len(item) for item in items)
+    if total_chars > 600:
+        body_font_size = Pt(14)
+    elif total_chars > 350:
+        body_font_size = Pt(16)
+    else:
+        body_font_size = Pt(18)
+
+    txBox = slide.shapes.add_textbox(body_left, body_top, body_width, body_height)
+    tf = txBox.text_frame
+    tf.word_wrap = True
+
+    for i, item in enumerate(items):
+        if i == 0:
+            p = tf.paragraphs[0]
+        else:
+            p = tf.add_paragraph()
+        p.text = item
+        p.font.size = body_font_size
+        p.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
+        p.font.name = "微软雅黑"
+        p.space_after = Pt(4)
+        p.space_before = Pt(2)
 
 
 def _replace_end_text(slide, data: SlideContent, theme: dict):
@@ -365,43 +412,29 @@ def _replace_end_text(slide, data: SlideContent, theme: dict):
         if i == 0:
             _set_shape_text(ts["shape"], data.title)
         else:
-            # 保留其余文本（如"THANK YOU"、图片等）
             pass
 
 
 def _set_shape_text(shape, new_text: str):
-    """替换shape中的文本，保留第一个run的格式
-    
-    只修改run的text属性，不改动font、color等任何格式。
-    """
+    """替换shape中的文本，保留第一个run的格式"""
     if not shape.has_text_frame:
         return
-    
     tf = shape.text_frame
-    
-    # 找到第一个有文本的paragraph
     for para in tf.paragraphs:
         if para.runs:
-            # 保留第一个run的格式，设置新文本
             para.runs[0].text = new_text
-            # 清空其余runs
             for run in para.runs[1:]:
                 run.text = ""
         else:
-            # 没有run的段落，直接设置text
             para.text = new_text
 
 
+# ══════════════════════════════════════════════════════════════
+#  模板分析 & 克隆
+# ══════════════════════════════════════════════════════════════
+
 def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
-    """分析模板中一个实际slide的结构
-    
-    识别规则：
-    - cover: 有大标题(40pt+)、有姓名/学号等字段、有图片
-    - section: 有"PART"字样或大号数字(96pt+)编号(01/02/03/04)
-    - toc: 有"目录/CONTENTS"字样
-    - content: 有标题(28pt左右) + 多个分布的小标题(20pt左右)
-    - end: 有"谢谢/感谢/批评指正"等关键词
-    """
+    """分析模板中一个实际slide的结构"""
     shapes_info = []
     has_big_title = False
     has_subtitle = False
@@ -414,27 +447,25 @@ def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
     has_image = False
     small_title_count = 0
 
+    sw_in = sw / 914400
+    sh_in = sh / 914400
+
     for shape in slide.shapes:
-        # 检测图片
         if hasattr(shape, 'image'):
             has_image = True
             continue
-
         if not shape.has_text_frame:
             continue
 
-        left_cm = shape.left / 914400
-        top_cm = shape.top / 914400
-        width_cm = shape.width / 914400
-        height_cm = shape.height / 914400
-        sw_cm = sw / 914400
-        sh_cm = sh / 914400
+        left_in = shape.left / 914400
+        top_in = shape.top / 914400
+        width_in = shape.width / 914400
+        height_in = shape.height / 914400
 
         text = shape.text_frame.text.strip()
         if not text:
             continue
 
-        # 分析字号
         shape_max_font = 0
         for para in shape.text_frame.paragraphs:
             for run in para.runs:
@@ -443,55 +474,36 @@ def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
                     shape_max_font = max(shape_max_font, font_pt)
                     max_font_size = max(max_font_size, font_pt)
 
-        is_top = top_cm < sh_cm * 0.4
-
-        # 检测章节标记: 大号数字(96pt) 或 "PART" 字样
+        is_top = top_in < sh_in * 0.4
         text_lower = text.lower().strip()
+
         if shape_max_font >= 60 and (text.isdigit() or len(text) <= 3):
             has_section_marker = True
         if "part" in text_lower:
             has_section_marker = True
-
-        # 检测目录标记
         if any(kw in text_lower for kw in ["目录", "contents", "目 录"]):
             has_toc_marker = True
-
-        # 检测结尾标记
         if any(kw in text_lower for kw in ["谢谢", "感谢", "thank", "批评指正", "结束", "聆听"]):
             has_end_marker = True
-
-        # 检测大标题(40pt+)
         if shape_max_font >= 40 and is_top:
             has_big_title = True
             title_font_size = max(title_font_size, shape_max_font)
-
-        # 检测小标题(16-24pt，在页面中下部分)
         if 16 <= shape_max_font <= 24 and not is_top:
             small_title_count += 1
-
-        # 检测正文标题(28pt左右)
         if 24 <= shape_max_font <= 32:
             has_body = True
-
-        # 检测姓名/学号等字段
         if any(kw in text for kw in ["姓名", "学号", "老师", "姓名："]):
             has_subtitle = True
 
         shapes_info.append({
-            "shape": shape,
-            "text": text,
-            "left": shape.left,
-            "top": shape.top,
-            "width": shape.width,
-            "height": shape.height,
+            "shape": shape, "text": text,
+            "left": shape.left, "top": shape.top,
+            "width": shape.width, "height": shape.height,
             "font_size": shape_max_font,
-            "is_top": is_top,
-            "is_bottom": not is_top,
-            "is_center": left_cm > sw_cm * 0.2 and (left_cm + width_cm) < sw_cm * 0.8,
+            "is_top": is_top, "is_bottom": not is_top,
             "para_count": len(shape.text_frame.paragraphs),
         })
 
-    # ── 判断slide类型 ──
     if has_end_marker:
         slide_type = "end"
     elif has_toc_marker:
@@ -499,52 +511,37 @@ def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
     elif has_section_marker:
         slide_type = "section"
     elif has_big_title and has_image:
-        # 有大标题+图片 → 封面页
         slide_type = "cover"
     elif has_big_title and has_subtitle:
         slide_type = "cover"
     elif has_big_title and not has_body and not has_section_marker:
-        # 只有大标题没有正文 → 封面页
         slide_type = "cover"
     elif has_body or small_title_count >= 2:
         slide_type = "content"
     else:
-        slide_type = "content"  # 默认
+        slide_type = "content"
 
-    # 收集可填充的文本区域
     text_areas = []
     for si in shapes_info:
         if si["text"]:
             text_areas.append({
-                "left": si["left"],
-                "top": si["top"],
-                "width": si["width"],
-                "height": si["height"],
+                "left": si["left"], "top": si["top"],
+                "width": si["width"], "height": si["height"],
                 "font_size": si["font_size"],
-                "is_top": si["is_top"],
-                "is_bottom": si["is_bottom"],
+                "is_top": si["is_top"], "is_bottom": si["is_bottom"],
                 "para_count": si["para_count"],
             })
 
     return {
-        "type": slide_type,
-        "shapes": shapes_info,
-        "text_areas": text_areas,
-        "has_big_title": has_big_title,
-        "has_body": has_body,
-        "has_image": has_image,
-        "has_section_marker": has_section_marker,
-        "small_title_count": small_title_count,
-        "max_font_size": max_font_size,
+        "type": slide_type, "shapes": shapes_info, "text_areas": text_areas,
+        "has_big_title": has_big_title, "has_body": has_body,
+        "has_image": has_image, "has_section_marker": has_section_marker,
+        "small_title_count": small_title_count, "max_font_size": max_font_size,
     }
 
 
 def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
-    """复制模板slide到新演示文稿（包括背景、图片和形状）
-
-    跨Presentation复制时，图片需要通过blob重新添加，
-    非图片形状则深度复制XML元素。同时复制背景XML。
-    """
+    """复制模板slide到新演示文稿（包括背景、图片和形状）"""
     import copy
 
     blank_layout = prs.slide_layouts[6]
@@ -561,7 +558,6 @@ def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
                 new_cSld.remove(new_bg)
             new_cSld.insert(0, copy.deepcopy(src_bg))
 
-    # 复制所有形状（图片用add_picture，其他深拷贝XML）
     for shape in source_slide.shapes:
         try:
             img_blob = shape.image.blob
@@ -579,17 +575,80 @@ def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
 
 
 # ══════════════════════════════════════════════════════════════
+#  图片插入
+# ══════════════════════════════════════════════════════════════
+
+def _insert_images_template(prs, slide_plan, searcher, theme, sw, sh):
+    """模板模式的图片插入——使用slide_plan正确映射索引，图片占右侧大面积"""
+    for plan_idx, (slide_type, data, tmpl_idx, sec_num) in enumerate(slide_plan):
+        if slide_type != "content":
+            continue
+        if not data.keywords:
+            continue
+
+        query = translate_keywords(data.keywords) or data.image_query
+        if not query:
+            continue
+        results = searcher.search_images(query, per_page=1, orientation="landscape")
+        if not results:
+            continue
+        img_data = searcher.download_image(results[0]["url"])
+        if not img_data:
+            continue
+
+        try:
+            slide = prs.slides[plan_idx]
+            img_stream = BytesIO(img_data)
+
+            # 图片放在右侧，占约45%页面宽度、75%页面高度
+            img_left = int(sw * 0.53)
+            img_top = int(sh * 0.12)
+            img_width = int(sw * 0.43)
+            img_height = int(sh * 0.72)
+
+            slide.shapes.add_picture(img_stream, img_left, img_top, img_width, img_height)
+        except Exception as e:
+            print(f"插入图片失败: {e}")
+
+
+def _insert_images_builtin(prs, slides, searcher, theme):
+    """内置风格的图片插入——图片占右侧大面积"""
+    for i, slide_data in enumerate(slides):
+        if slide_data.layout not in ("image_text", "content"):
+            continue
+        if not slide_data.image_query:
+            continue
+        query = translate_keywords(slide_data.keywords) or slide_data.image_query
+        results = searcher.search_images(query, per_page=1, orientation="landscape")
+        if not results:
+            continue
+        img_data = searcher.download_image(results[0]["url"])
+        if not img_data:
+            continue
+        try:
+            img_stream = BytesIO(img_data)
+            slide = prs.slides[i]
+            # 图片占右侧约40%宽度、70%高度
+            img_left = int(prs.slide_width * 0.57)
+            img_top = int(prs.slide_height * 0.15)
+            img_width = int(prs.slide_width * 0.38)
+            img_height = int(prs.slide_height * 0.68)
+            slide.shapes.add_picture(img_stream, img_left, img_top, img_width, img_height)
+        except Exception as e:
+            print(f"插入图片失败: {e}")
+
+
+# ══════════════════════════════════════════════════════════════
 #  预览功能 - 生成幻灯片缩略图
 # ══════════════════════════════════════════════════════════════
 
 def generate_preview_html(prs: Presentation) -> str:
     """生成PPT预览的HTML，直接在浏览器中渲染（解决中文乱码问题）"""
     slides_html = []
-    sw_cm = prs.slide_width / 914400
-    sh_cm = prs.slide_height / 914400
+    sw_cm = prs.slide_width / EMU_PER_CM
+    sh_cm = prs.slide_height / EMU_PER_CM
 
     for page_idx, slide in enumerate(prs.slides):
-        # 获取背景色
         bg_color = "#FFFFFF"
         try:
             bg = slide.background
@@ -612,7 +671,6 @@ def generate_preview_html(prs: Presentation) -> str:
                 if not text:
                     continue
 
-                # 获取字号
                 font_size = 14
                 font_color = "#333333"
                 font_bold = False
@@ -629,9 +687,7 @@ def generate_preview_html(prs: Presentation) -> str:
                 except:
                     pass
 
-                # 转义HTML特殊字符
                 text_escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-                # 截断过长文本
                 lines = text_escaped.split('\n')
                 display_lines = '<br>'.join(lines[:8])
                 if len(lines) > 8:
@@ -647,7 +703,6 @@ def generate_preview_html(prs: Presentation) -> str:
                 )
 
             elif hasattr(shape, 'image'):
-                # 图片占位
                 shapes_html.append(
                     f'<div style="position:absolute;left:{left_pct}%;top:{top_pct}%;'
                     f'width:{width_pct}%;height:{height_pct}%;'
@@ -671,7 +726,7 @@ def generate_preview_images(prs: Presentation) -> List[bytes]:
 
 
 # ══════════════════════════════════════════════════════════════
-#  内置风格绘制 — 全页填充布局
+#  内置风格绘制 — 全页填充布局 + 图文混排
 # ══════════════════════════════════════════════════════════════
 
 def _draw_title_slide(slide, data, theme):
@@ -734,10 +789,15 @@ def _draw_section_slide(slide, data, theme):
 
 
 def _draw_content_slide(slide, data, theme):
+    """内容页：有配图时左侧文字+右侧图片区域，无配图时文字满宽"""
     dc = theme["decorative_colors"]
     _add_shape(slide, 0, 0, SLIDE_WIDTH, Cm(0.35), theme["accent_color"])
     _add_shape(slide, 0, Cm(0.35), SLIDE_WIDTH, Cm(0.06), dc[3] if len(dc)>3 else dc[0])
 
+    # 判断是否有配图（预留右侧空间）
+    has_image = bool(data.keywords and len(data.keywords) > 0)
+
+    # 标题
     txBox = _add_textbox(slide, Cm(1.5), Cm(0.7), SLIDE_WIDTH - Cm(3.0), Cm(1.8))
     tf = txBox.text_frame
     tf.word_wrap = True
@@ -751,14 +811,28 @@ def _draw_content_slide(slide, data, theme):
     _add_shape(slide, Cm(1.0), Cm(0.7), Cm(0.12), Cm(1.5), theme["accent_color"])
     _add_shape(slide, Cm(1.5), Cm(2.6), Cm(4.0), Cm(0.04), theme["accent_color"])
 
-    _add_shape(slide, Cm(1.2), Cm(2.9), SLIDE_WIDTH - Cm(2.4), Cm(12.8),
-               theme["bg_color2"], alpha=0.35, corner_radius=Cm(0.3))
-
     body_top = Cm(3.3)
-    body_height = Cm(11.5)
+    body_height = SLIDE_HEIGHT - Cm(4.5)
+
+    if has_image:
+        # 图文混排：文字占左55%，图片占右40%
+        text_width = SLIDE_WIDTH * 52 // 100
+        _add_shape(slide, Cm(1.2), Cm(2.9), text_width - Cm(1.2), body_height + Cm(0.4),
+                   theme["bg_color2"], alpha=0.35, corner_radius=Cm(0.3))
+        # 右侧图片区域背景
+        img_area_left = SLIDE_WIDTH * 56 // 100
+        img_area_width = SLIDE_WIDTH - img_area_left - Cm(0.8)
+        _add_shape(slide, img_area_left, Cm(2.9), img_area_width, body_height + Cm(0.4),
+                   theme["bg_color2"], alpha=0.15, corner_radius=Cm(0.3))
+        actual_text_width = text_width - Cm(1.5)
+    else:
+        # 文字满宽
+        _add_shape(slide, Cm(1.2), Cm(2.9), SLIDE_WIDTH - Cm(2.4), body_height + Cm(0.4),
+                   theme["bg_color2"], alpha=0.35, corner_radius=Cm(0.3))
+        actual_text_width = SLIDE_WIDTH - Cm(4.0)
 
     if data.bullet_items:
-        txBox2 = _add_textbox(slide, Cm(2.0), body_top, SLIDE_WIDTH - Cm(4.0), body_height)
+        txBox2 = _add_textbox(slide, Cm(2.0), body_top, actual_text_width, body_height)
         tf2 = txBox2.text_frame
         tf2.word_wrap = True
         for i, item in enumerate(data.bullet_items):
@@ -774,7 +848,7 @@ def _draw_content_slide(slide, data, theme):
             p.space_before = Pt(4)
 
     elif data.body_lines:
-        txBox2 = _add_textbox(slide, Cm(2.0), body_top, SLIDE_WIDTH - Cm(4.0), body_height)
+        txBox2 = _add_textbox(slide, Cm(2.0), body_top, actual_text_width, body_height)
         tf2 = txBox2.text_frame
         tf2.word_wrap = True
         for i, line in enumerate(data.body_lines):
@@ -911,35 +985,6 @@ def _deco_neon(slide, dc, theme, layout):
     _add_shape(slide, 0, SLIDE_HEIGHT - Cm(0.3), SLIDE_WIDTH, Cm(0.3), dc[0], alpha=0.7)
     _add_shape(slide, 0, 0, SLIDE_WIDTH, Cm(0.15), dc[1], alpha=0.5)
     _add_shape(slide, 0, 0, Cm(0.15), SLIDE_HEIGHT, dc[0], alpha=0.4)
-
-
-# ══════════════════════════════════════════════════════════════
-#  图片插入
-# ══════════════════════════════════════════════════════════════
-
-def _insert_images(prs, slides, searcher, theme):
-    for i, slide_data in enumerate(slides):
-        if slide_data.layout not in ("image_text", "content"):
-            continue
-        if not slide_data.image_query:
-            continue
-        query = translate_keywords(slide_data.keywords) or slide_data.image_query
-        results = searcher.search_images(query, per_page=1, orientation="landscape")
-        if not results:
-            continue
-        img_data = searcher.download_image(results[0]["url"])
-        if not img_data:
-            continue
-        try:
-            img_stream = BytesIO(img_data)
-            slide = prs.slides[i]
-            img_width = int(Cm(7.0))
-            img_height = int(Cm(5.0))
-            img_left = prs.slide_width - int(Cm(1.5)) - img_width
-            img_top = prs.slide_height - int(Cm(1.5)) - img_height
-            slide.shapes.add_picture(img_stream, img_left, img_top, img_width, img_height)
-        except Exception as e:
-            print(f"插入图片失败: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
