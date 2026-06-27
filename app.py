@@ -336,6 +336,9 @@ if st.session_state.get("parsed") and st.session_state.get("slides"):
     # ── 下载区 ──
     if st.session_state.get("generated") and st.session_state.get("pptx_bytes"):
 
+        pptx_bytes = st.session_state["pptx_bytes"]
+        filename = st.session_state["filename"]
+
         st.divider()
         st.subheader("📥 下载文件")
 

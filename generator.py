@@ -316,10 +316,13 @@ def _replace_text_in_slide(slide, data: SlideContent, theme: dict,
         # 正文区：按字号排序，最大→标题，其余→正文要点
         content_sorted = sorted(content_shapes, key=lambda x: -x["font_size"])
         content_idx = 0
+        title_shape = None
+        
         for i, ts in enumerate(content_sorted):
             if i == 0:
                 # 标题
                 _set_shape_text(ts["shape"], data.title)
+                title_shape = ts["shape"]
             else:
                 # 正文要点
                 if content_idx < len(items):
@@ -327,6 +330,33 @@ def _replace_text_in_slide(slide, data: SlideContent, theme: dict,
                     content_idx += 1
                 else:
                     _set_shape_text(ts["shape"], "")
+        
+        # 如果要点还有剩余，在标题下方添加新文本框
+        remaining_items = items[content_idx:] if content_idx < len(items) else []
+        if remaining_items and title_shape:
+            from pptx.util import Pt, Cm
+            # 在标题文本框下方添加正文文本框
+            title_bottom = title_shape.top + title_shape.height
+            body_left = title_shape.left
+            body_width = title_shape.width
+            body_height = int(Cm(8.0))
+            
+            txBox = slide.shapes.add_textbox(
+                body_left, title_bottom + int(Cm(0.3)),
+                body_width, body_height
+            )
+            tf = txBox.text_frame
+            tf.word_wrap = True
+            for j, item in enumerate(remaining_items):
+                if j == 0:
+                    p = tf.paragraphs[0]
+                else:
+                    p = tf.add_paragraph()
+                p.text = f"  •  {item}"
+                p.font.size = Pt(16)
+                p.font.color.rgb = RGBColor(0x33, 0x33, 0x33)
+                p.font.name = "微软雅黑"
+                p.space_after = Pt(6)
 
 
 def _set_shape_text(shape, new_text: str):
