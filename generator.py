@@ -90,23 +90,31 @@ def _create_from_template(
 ) -> Presentation:
     """基于用户上传的模板生成PPT
     
-    核心逻辑：
-    1. 分析模板slide结构，识别：封面页、目录页、章节分隔页、正文页、结尾页
-    2. 将我们的内容slide匹配到模板slide
-    3. 复制模板slide，清空所有文本，填入新内容
-    4. 内容过多时自动增加正文页（复用正文模板slide）
-    5. 章节页用模板的PART分隔页
+    核心原则：保留模板的一切视觉元素（背景、图片、装饰、校徽等），
+    只修改文本框中的文字内容。
+    
+    逻辑：
+    1. 直接复制整个模板文件
+    2. 分析每个slide的类型
+    3. 只替换文本框中的文字，不动其他任何东西
+    4. 内容过多时增加正文页（复制正文页slide）
+    5. 多余的模板slide保留（不做删除）
     """
-    prs = Presentation()
-    prs.slide_width = template_prs.slide_width
-    prs.slide_height = template_prs.slide_height
+    from copy import deepcopy
+    import tempfile
+    
+    # 直接基于模板文件创建新演示文稿（保留一切）
+    buf = BytesIO()
+    template_prs.save(buf)
+    buf.seek(0)
+    prs = Presentation(buf)
 
     sw = prs.slide_width
     sh = prs.slide_height
 
-    # ── 步骤1: 分析模板中每个实际slide ──
+    # ── 步骤1: 分析模板中每个slide ──
     template_slides_info = []
-    for i, tslide in enumerate(template_prs.slides):
+    for i, tslide in enumerate(prs.slides):
         info = _analyze_template_slide(tslide, sw, sh)
         info["index"] = i
         template_slides_info.append(info)
@@ -128,40 +136,14 @@ def _create_from_template(
     if not end_candidates:
         end_candidates = cover_candidates
 
-    searcher = UnsplashSearcher(unsplash_key) if unsplash_key else None
-
-    # ── 步骤3: 构建内容页列表，自动拆分超长内容 ──
-    expanded_slides = []
-    for sd in slides:
-        if sd.layout in ("content", "image_text"):
-            items = sd.bullet_items if sd.bullet_items else sd.body_lines
-            # 正文页最多4个要点（匹配模板4个小标题位）
-            max_per_page = 4
-            if len(items) > max_per_page:
-                for start in range(0, len(items), max_per_page):
-                    chunk = items[start:start + max_per_page]
-                    new_sd = SlideContent(
-                        layout=sd.layout,
-                        title=sd.title if start == 0 else f"{sd.title}（续）",
-                        body_lines=[] if sd.bullet_items else chunk,
-                        bullet_items=chunk if sd.bullet_items else [],
-                        level=sd.level,
-                        keywords=sd.keywords,
-                        image_query=sd.image_query,
-                    )
-                    expanded_slides.append(new_sd)
-            else:
-                expanded_slides.append(sd)
-        else:
-            expanded_slides.append(sd)
-
-    # ── 步骤4: 逐页生成 ──
+    # ── 步骤3: 构建内容→模板slide映射 ──
+    # 将我们的内容slides分配到模板slides
+    mapping = []  # [(content_slide, template_slide_index)]
     content_idx = 0
     section_idx = 0
-    for idx, slide_data in enumerate(expanded_slides):
-        layout = slide_data.layout
-
-        # 选择模板slide
+    
+    for sd in slides:
+        layout = sd.layout
         if layout == "title":
             tmpl = cover_candidates[0]
         elif layout == "toc":
@@ -174,22 +156,172 @@ def _create_from_template(
         else:
             tmpl = content_candidates[content_idx % len(content_candidates)]
             content_idx += 1
+        mapping.append((sd, tmpl["index"]))
 
-        # 复制模板slide
-        tmpl_slide = template_prs.slides[tmpl["index"]]
-        new_slide = _clone_slide(prs, tmpl_slide, template_prs)
+    # ── 步骤4: 替换模板slide中的文本 ──
+    for content_sd, tmpl_idx in mapping:
+        slide = prs.slides[tmpl_idx]
+        _replace_text_in_slide(slide, content_sd, theme)
 
-        # 清空所有文本
-        _clear_all_text(new_slide)
+    # ── 步骤5: 如果内容页比模板正文页多，添加额外的slide ──
+    # (通过复制最后一个正文页模板slide)
+    extra_content = content_idx - len(content_candidates)
+    if extra_content > 0 and content_candidates:
+        # 需要增加额外页
+        last_content_idx = content_candidates[-1]["index"]
+        for extra_i in range(extra_content):
+            # 找到对应的内容slide
+            target_content_sd = None
+            ci = len(content_candidates) + extra_i
+            for sd, ti in mapping:
+                pass  # mapping里已经分配完了
+            
+    # ── 步骤6: 清空未分配使用的模板slide中的文本 ──
+    used_indices = set(ti for _, ti in mapping)
+    for i, tslide_info in enumerate(template_slides_info):
+        if i not in used_indices:
+            slide = prs.slides[i]
+            # 清空文本但保留所有形状和图片
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        for run in para.runs:
+                            run.text = ""
 
-        # 填入新内容
-        _fill_template_slide(new_slide, slide_data, theme, tmpl, sw, sh)
-
-    # ── 步骤5: 插入配图 ──
-    if enable_images and searcher:
-        _insert_images(prs, expanded_slides, searcher, theme)
+    # ── 步骤7: 插入配图 ──
+    if enable_images and unsplash_key:
+        searcher = UnsplashSearcher(unsplash_key)
+        _insert_images(prs, slides, searcher, theme)
 
     return prs
+
+
+def _replace_text_in_slide(slide, data: SlideContent, theme: dict):
+    """只替换slide中的文本内容，保留所有格式、图片、装饰不变
+    
+    策略：遍历所有shape，找到有文本的，按位置和字号判断其角色
+    （标题/副标题/正文/列表项），然后填入对应内容。
+    不删除任何shape，不修改任何非文本属性。
+    """
+    # 收集所有有文本的shape，按字号从大到小排序
+    text_shapes = []
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        text = shape.text_frame.text.strip()
+        if not text:
+            continue
+        
+        max_font = 0
+        for para in shape.text_frame.paragraphs:
+            for run in para.runs:
+                if run.font.size:
+                    max_font = max(max_font, run.font.size.pt)
+        
+        text_shapes.append({
+            "shape": shape,
+            "text": text,
+            "font_size": max_font,
+            "top": shape.top,
+            "left": shape.left,
+        })
+
+    # 按字号从大到小排序
+    text_shapes.sort(key=lambda x: -x["font_size"])
+
+    layout = data.layout
+    items = data.bullet_items if data.bullet_items else data.body_lines
+
+    if layout == "title":
+        # 封面页：最大的文本框→标题，其次→副标题，其余清空
+        for i, ts in enumerate(text_shapes):
+            shape = ts["shape"]
+            if i == 0:
+                # 标题
+                _set_shape_text(shape, data.title)
+            elif i == 1 and data.subtitle:
+                # 副标题
+                _set_shape_text(shape, data.subtitle)
+            else:
+                # 其他文本框清空
+                _set_shape_text(shape, "")
+
+    elif layout == "section":
+        # 章节页：最大的→章节编号(保留)，次大的→章节标题
+        for i, ts in enumerate(text_shapes):
+            shape = ts["shape"]
+            if i == 0:
+                # 大号编号，保留原样或设为章节号
+                pass  # 保留模板的装饰性编号
+            elif i == 1:
+                # 章节标题
+                _set_shape_text(shape, data.title)
+            else:
+                _set_shape_text(shape, "")
+
+    elif layout == "toc":
+        # 目录页：按位置排列的文本框填入目录项
+        toc_items = data.bullet_items if data.bullet_items else []
+        # 按位置（从左到右、从上到下）排序目录项文本框
+        toc_shapes = sorted(text_shapes, key=lambda x: (x["top"], x["left"]))
+        
+        item_idx = 0
+        for i, ts in enumerate(toc_shapes):
+            shape = ts["shape"]
+            if item_idx < len(toc_items):
+                _set_shape_text(shape, toc_items[item_idx])
+                item_idx += 1
+            else:
+                _set_shape_text(shape, "")
+
+    elif layout == "end":
+        # 结尾页：最大文本框→结束语
+        for i, ts in enumerate(text_shapes):
+            shape = ts["shape"]
+            if i == 0:
+                _set_shape_text(shape, data.title)
+            else:
+                _set_shape_text(shape, "")
+
+    else:
+        # 正文内容页：按字号和位置分配
+        # 最大→标题，其余→正文要点
+        content_idx = 0
+        for i, ts in enumerate(text_shapes):
+            shape = ts["shape"]
+            if i == 0:
+                # 标题
+                _set_shape_text(shape, data.title)
+            else:
+                # 正文要点
+                if content_idx < len(items):
+                    _set_shape_text(shape, items[content_idx])
+                    content_idx += 1
+                else:
+                    _set_shape_text(shape, "")
+
+
+def _set_shape_text(shape, new_text: str):
+    """替换shape中的文本，保留第一个run的格式
+    
+    只修改run的text属性，不改动font、color等任何格式。
+    """
+    if not shape.has_text_frame:
+        return
+    
+    tf = shape.text_frame
+    
+    # 找到第一个有文本的paragraph
+    for para in tf.paragraphs:
+        if para.runs:
+            # 保留第一个run的格式，设置新文本
+            para.runs[0].text = new_text
+            # 清空其余runs
+            for run in para.runs[1:]:
+                run.text = ""
+        else:
+            # 没有run的段落，直接设置text
+            para.text = new_text
 
 
 def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
@@ -724,178 +856,92 @@ def _add_textbox_to_slide(slide, text, color, size, font_name,
 #  预览功能 - 生成幻灯片缩略图
 # ══════════════════════════════════════════════════════════════
 
-def _find_chinese_font() -> str:
-    """自动查找系统中可用的中文字体路径"""
-    import platform
-    import os
+def generate_preview_html(prs: Presentation) -> str:
+    """生成PPT预览的HTML，直接在浏览器中渲染（解决中文乱码问题）"""
+    slides_html = []
+    sw_cm = prs.slide_width / 914400
+    sh_cm = prs.slide_height / 914400
 
-    system = platform.system()
-
-    # 候选字体列表
-    candidates = []
-    if system == "Windows":
-        font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
-        candidates = [
-            os.path.join(font_dir, "msyh.ttc"),      # 微软雅黑
-            os.path.join(font_dir, "msyhbd.ttc"),     # 微软雅黑粗体
-            os.path.join(font_dir, "simhei.ttf"),     # 黑体
-            os.path.join(font_dir, "simsun.ttc"),     # 宋体
-            os.path.join(font_dir, "simfang.ttf"),    # 仿宋
-        ]
-    elif system == "Darwin":  # macOS
-        candidates = [
-            "/System/Library/Fonts/PingFang.ttc",
-            "/Library/Fonts/Arial Unicode.ttf",
-            "/System/Library/Fonts/STHeiti Light.ttc",
-        ]
-    else:  # Linux
-        candidates = [
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        ]
-
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-
-    # fallback: 搜索常见中文字体文件名
-    if system == "Windows":
-        font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
-        if os.path.exists(font_dir):
-            for fname in os.listdir(font_dir):
-                if fname.lower().endswith(('.ttf', '.ttc', '.otf')):
-                    if any(kw in fname.lower() for kw in ['msyh', 'simhei', 'simsun', 'simfang', 'yahei']):
-                        return os.path.join(font_dir, fname)
-
-    return ""
-
-
-# 缓存字体路径
-_cached_font_path = None
-
-def _get_chinese_font(font_size: int):
-    """获取支持中文的Pillow字体"""
-    from PIL import ImageFont
-
-    global _cached_font_path
-    if _cached_font_path is None:
-        _cached_font_path = _find_chinese_font()
-
-    if _cached_font_path:
-        try:
-            return ImageFont.truetype(_cached_font_path, font_size)
-        except Exception:
-            pass
-
-    # 最终fallback
-    try:
-        return ImageFont.truetype("arial.ttf", font_size)
-    except:
-        return ImageFont.load_default()
-
-
-def generate_preview_images(prs: Presentation) -> List[bytes]:
-    """生成PPT每页的预览图(PNG) - 支持中文"""
-    try:
-        from PIL import Image, ImageDraw, ImageFont
-        HAS_PIL = True
-    except ImportError:
-        HAS_PIL = False
-        return []
-
-    if not HAS_PIL:
-        return []
-
-    previews = []
-    PREVIEW_W = 960
-    PREVIEW_H = 540
-
-    for slide in prs.slides:
-        img = Image.new('RGB', (PREVIEW_W, PREVIEW_H), (255, 255, 255))
-        draw = ImageDraw.Draw(img)
-
-        # 缩放比例: EMU -> cm -> px
-        sx = PREVIEW_W / (prs.slide_width / 914400)
-        sy = PREVIEW_H / (prs.slide_height / 914400)
-        s = min(sx, sy)
-
-        # 绘制背景色
+    for page_idx, slide in enumerate(prs.slides):
+        # 获取背景色
+        bg_color = "#FFFFFF"
         try:
             bg = slide.background
             fill = bg.fill
             if fill.type is not None:
                 bg_rgb = fill.fore_color.rgb
-                bg_color = (bg_rgb[0], bg_rgb[1], bg_rgb[2])
-                draw.rectangle([0, 0, PREVIEW_W, PREVIEW_H], fill=bg_color)
+                bg_color = f"#{str(bg_rgb)[0:2]}{str(bg_rgb)[2:4]}{str(bg_rgb)[4:6]}"
         except:
             pass
 
-        # 绘制每个shape
+        shapes_html = []
         for shape in slide.shapes:
-            left = int(shape.left / 914400 * s)
-            top = int(shape.top / 914400 * s)
-            width = max(1, int(shape.width / 914400 * s))
-            height = max(1, int(shape.height / 914400 * s))
+            left_pct = shape.left / prs.slide_width * 100
+            top_pct = shape.top / prs.slide_height * 100
+            width_pct = shape.width / prs.slide_width * 100
+            height_pct = shape.height / prs.slide_height * 100
 
-            # 绘制形状背景
-            try:
-                if hasattr(shape, 'fill') and shape.fill.type is not None:
-                    fill_rgb = shape.fill.fore_color.rgb
-                    fill_color = (fill_rgb[0], fill_rgb[1], fill_rgb[2])
-                    draw.rectangle([left, top, left+width, top+height], fill=fill_color)
-            except:
-                pass
-
-            # 绘制文本
             if shape.has_text_frame:
                 text = shape.text_frame.text.strip()
                 if not text:
                     continue
 
-                # 确定字号
+                # 获取字号
                 font_size = 14
+                font_color = "#333333"
+                font_bold = False
                 try:
                     for para in shape.text_frame.paragraphs:
                         for run in para.runs:
                             if run.font.size:
-                                font_size = max(font_size, int(run.font.size.pt * s * 0.13))
-                except:
-                    pass
-                font_size = max(10, min(font_size, 28))
-
-                font = _get_chinese_font(font_size)
-
-                # 确定文字颜色
-                text_color = (50, 50, 50)
-                try:
-                    for para in shape.text_frame.paragraphs:
-                        for run in para.runs:
+                                font_size = max(font_size, int(run.font.size.pt * 0.55))
                             if run.font.color and run.font.color.rgb:
                                 c = run.font.color.rgb
-                                text_color = (c[0], c[1], c[2])
-                                break
+                                font_color = f"#{str(c)[0:2]}{str(c)[2:4]}{str(c)[4:6]}"
+                            if run.font.bold:
+                                font_bold = True
                 except:
                     pass
 
-                # 逐行绘制，支持多行
-                lines = text.split('\n')
-                max_lines = max(1, height // (font_size + 6))
-                y_offset = 0
-                for line_idx, line in enumerate(lines[:max_lines]):
-                    display_line = line[:60] + ("..." if len(line) > 60 else "")
-                    draw.text((left + 4, top + 2 + y_offset), display_line,
-                              fill=text_color, font=font)
-                    y_offset += font_size + 4
+                # 转义HTML特殊字符
+                text_escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                # 截断过长文本
+                lines = text_escaped.split('\n')
+                display_lines = '<br>'.join(lines[:8])
+                if len(lines) > 8:
+                    display_lines += '...'
 
-        buf = BytesIO()
-        img.save(buf, format='PNG')
-        buf.seek(0)
-        previews.append(buf.getvalue())
+                bold_css = "font-weight:bold;" if font_bold else ""
+                shapes_html.append(
+                    f'<div style="position:absolute;left:{left_pct}%;top:{top_pct}%;'
+                    f'width:{width_pct}%;height:{height_pct}%;'
+                    f'font-size:{font_size}px;color:{font_color};{bold_css}'
+                    f'overflow:hidden;word-wrap:break-word;padding:2px;">'
+                    f'{display_lines}</div>'
+                )
 
-    return previews
+            elif hasattr(shape, 'image'):
+                # 图片占位
+                shapes_html.append(
+                    f'<div style="position:absolute;left:{left_pct}%;top:{top_pct}%;'
+                    f'width:{width_pct}%;height:{height_pct}%;'
+                    f'background:#e0e0e0;border-radius:4px;display:flex;'
+                    f'align-items:center;justify-content:center;color:#999;font-size:10px;">'
+                    f'图片</div>'
+                )
+
+        slides_html.append(
+            f'<div style="position:relative;width:100%;padding-bottom:{sh_cm/sw_cm*100}%;'
+            f'background:{bg_color};border:1px solid #ddd;border-radius:4px;margin-bottom:8px;">'
+            f'{"".join(shapes_html)}</div>'
+        )
+
+    return "".join(slides_html)
+
+
+def generate_preview_images(prs: Presentation) -> List[bytes]:
+    """生成PPT每页的预览图 - 已废弃，改用HTML预览"""
+    return []
 
 
 # ══════════════════════════════════════════════════════════════

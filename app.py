@@ -8,7 +8,7 @@ from pptx import Presentation
 
 from styles import STYLE_CATEGORIES, LAYOUT_NAMES, get_style_name, get_theme
 from parser import parse_markdown, parse_plain_text, extract_keywords, SlideContent
-from generator import create_presentation, export_to_bytes, generate_preview_images
+from generator import create_presentation, export_to_bytes, generate_preview_html
 from image_search import UnsplashSearcher
 
 st.set_page_config(
@@ -316,13 +316,13 @@ if st.session_state.get("parsed") and st.session_state.get("slides"):
                 style_name = "导入模板" if use_template else get_style_name(style_id)
                 filename = f"智能PPT_{style_name}_{len(slides)}页.pptx"
 
-                # 生成预览图
-                preview_imgs = generate_preview_images(prs)
+                # 生成HTML预览
+                preview_html = generate_preview_html(prs)
 
                 st.session_state["pptx_bytes"] = pptx_bytes
                 st.session_state["filename"] = filename
                 st.session_state["generated"] = True
-                st.session_state["preview_imgs"] = preview_imgs
+                st.session_state["preview_html"] = preview_html
 
                 st.markdown(
                     f'<div class="success-box">'
@@ -344,18 +344,13 @@ if st.session_state.get("parsed") and st.session_state.get("slides"):
 
         pptx_bytes = st.session_state["pptx_bytes"]
         filename = st.session_state["filename"]
-        preview_imgs = st.session_state.get("preview_imgs", [])
+        preview_html = st.session_state.get("preview_html", "")
 
-        # 预览幻灯片
-        if preview_imgs:
-            # 使用tabs展示每页
-            tab_names = [f"第{i+1}页" for i in range(len(preview_imgs))]
-            tabs = st.tabs(tab_names)
-            for i, (tab, img_data) in enumerate(zip(tabs, preview_imgs)):
-                with tab:
-                    st.image(img_data, caption=f"第 {i+1} 页", use_container_width=True)
+        # HTML预览
+        if preview_html:
+            st.markdown(preview_html, unsafe_allow_html=True)
         else:
-            st.info("预览图生成失败，请下载后查看")
+            st.info("预览生成失败，请下载后查看")
 
         st.divider()
         st.subheader("📥 下载文件")
