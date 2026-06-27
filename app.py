@@ -353,7 +353,7 @@ if st.session_state.get("parsed") and st.session_state.get("slides"):
             tabs = st.tabs(tab_names)
             for i, (tab, img_data) in enumerate(zip(tabs, preview_imgs)):
                 with tab:
-                    st.image(img_data, caption=f"第 {i+1} 页", use_column_width=True)
+                    st.image(img_data, caption=f"第 {i+1} 页", use_container_width=True)
         else:
             st.info("预览图生成失败，请下载后查看")
 
