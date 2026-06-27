@@ -91,11 +91,11 @@ def _create_from_template(
     """基于用户上传的模板生成PPT
     
     核心逻辑：
-    1. 读取模板中每个实际slide，分析其布局类型（封面/目录/正文/结尾）
+    1. 分析模板slide结构，识别：封面页、目录页、章节分隔页、正文页、结尾页
     2. 将我们的内容slide匹配到模板slide
     3. 复制模板slide，清空所有文本，填入新内容
     4. 内容过多时自动增加正文页（复用正文模板slide）
-    5. 多余的模板slide不使用
+    5. 章节页用模板的PART分隔页
     """
     prs = Presentation()
     prs.slide_width = template_prs.slide_width
@@ -114,37 +114,68 @@ def _create_from_template(
     # ── 步骤2: 按类型分组 ──
     cover_candidates = [s for s in template_slides_info if s["type"] == "cover"]
     toc_candidates = [s for s in template_slides_info if s["type"] == "toc"]
+    section_candidates = [s for s in template_slides_info if s["type"] == "section"]
     content_candidates = [s for s in template_slides_info if s["type"] == "content"]
     end_candidates = [s for s in template_slides_info if s["type"] == "end"]
 
-    # fallback: 如果没有识别到某类，用content代替
+    # fallback
     if not cover_candidates:
-        cover_candidates = content_candidates[:1] if content_candidates else template_slides_info[:1]
+        cover_candidates = template_slides_info[:1]
+    if not section_candidates:
+        section_candidates = cover_candidates
     if not content_candidates:
         content_candidates = template_slides_info[1:2] if len(template_slides_info) > 1 else template_slides_info[:1]
     if not end_candidates:
-        end_candidates = cover_candidates[:1]  # 结尾页用封面页模板
+        end_candidates = cover_candidates
 
-    # ── 步骤3: 逐页生成，匹配模板slide ──
     searcher = UnsplashSearcher(unsplash_key) if unsplash_key else None
-    result_slide_count = 0
 
-    for idx, slide_data in enumerate(slides):
+    # ── 步骤3: 构建内容页列表，自动拆分超长内容 ──
+    expanded_slides = []
+    for sd in slides:
+        if sd.layout in ("content", "image_text"):
+            items = sd.bullet_items if sd.bullet_items else sd.body_lines
+            # 正文页最多4个要点（匹配模板4个小标题位）
+            max_per_page = 4
+            if len(items) > max_per_page:
+                for start in range(0, len(items), max_per_page):
+                    chunk = items[start:start + max_per_page]
+                    new_sd = SlideContent(
+                        layout=sd.layout,
+                        title=sd.title if start == 0 else f"{sd.title}（续）",
+                        body_lines=[] if sd.bullet_items else chunk,
+                        bullet_items=chunk if sd.bullet_items else [],
+                        level=sd.level,
+                        keywords=sd.keywords,
+                        image_query=sd.image_query,
+                    )
+                    expanded_slides.append(new_sd)
+            else:
+                expanded_slides.append(sd)
+        else:
+            expanded_slides.append(sd)
+
+    # ── 步骤4: 逐页生成 ──
+    content_idx = 0
+    section_idx = 0
+    for idx, slide_data in enumerate(expanded_slides):
         layout = slide_data.layout
 
-        # 选择最匹配的模板slide
+        # 选择模板slide
         if layout == "title":
             tmpl = cover_candidates[0]
         elif layout == "toc":
             tmpl = toc_candidates[0] if toc_candidates else content_candidates[0]
         elif layout == "section":
-            tmpl = content_candidates[0]
+            tmpl = section_candidates[section_idx % len(section_candidates)]
+            section_idx += 1
         elif layout == "end":
             tmpl = end_candidates[0]
-        else:  # content, image_text
-            tmpl = content_candidates[idx % len(content_candidates)]
+        else:
+            tmpl = content_candidates[content_idx % len(content_candidates)]
+            content_idx += 1
 
-        # 复制模板slide到新演示文稿
+        # 复制模板slide
         tmpl_slide = template_prs.slides[tmpl["index"]]
         new_slide = _clone_slide(prs, tmpl_slide, template_prs)
 
@@ -154,25 +185,41 @@ def _create_from_template(
         # 填入新内容
         _fill_template_slide(new_slide, slide_data, theme, tmpl, sw, sh)
 
-        result_slide_count += 1
-
-    # ── 步骤4: 插入配图 ──
+    # ── 步骤5: 插入配图 ──
     if enable_images and searcher:
-        _insert_images(prs, slides, searcher, theme)
+        _insert_images(prs, expanded_slides, searcher, theme)
 
     return prs
 
 
 def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
-    """分析模板中一个实际slide的结构"""
+    """分析模板中一个实际slide的结构
+    
+    识别规则：
+    - cover: 有大标题(40pt+)、有姓名/学号等字段、有图片
+    - section: 有"PART"字样或大号数字(96pt+)编号(01/02/03/04)
+    - toc: 有"目录/CONTENTS"字样
+    - content: 有标题(28pt左右) + 多个分布的小标题(20pt左右)
+    - end: 有"谢谢/感谢/批评指正"等关键词
+    """
     shapes_info = []
     has_big_title = False
     has_subtitle = False
     has_body = False
+    has_section_marker = False
+    has_toc_marker = False
+    has_end_marker = False
     title_font_size = 0
     max_font_size = 0
+    has_image = False
+    small_title_count = 0
 
     for shape in slide.shapes:
+        # 检测图片
+        if hasattr(shape, 'image'):
+            has_image = True
+            continue
+
         if not shape.has_text_frame:
             continue
 
@@ -196,25 +243,39 @@ def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
                     shape_max_font = max(shape_max_font, font_pt)
                     max_font_size = max(max_font_size, font_pt)
 
-        # 判断是否为大标题（字大、位置偏上、居中）
         is_top = top_cm < sh_cm * 0.4
-        is_center = left_cm > sw_cm * 0.2 and (left_cm + width_cm) < sw_cm * 0.8
-        is_large = shape_max_font >= 28 or (shape_max_font == 0 and len(text) < 30)
 
-        if is_top and is_large and len(text) < 50:
+        # 检测章节标记: 大号数字(96pt) 或 "PART" 字样
+        text_lower = text.lower().strip()
+        if shape_max_font >= 60 and (text.isdigit() or len(text) <= 3):
+            has_section_marker = True
+        if "part" in text_lower:
+            has_section_marker = True
+
+        # 检测目录标记
+        if any(kw in text_lower for kw in ["目录", "contents", "目 录"]):
+            has_toc_marker = True
+
+        # 检测结尾标记
+        if any(kw in text_lower for kw in ["谢谢", "感谢", "thank", "批评指正", "结束", "聆听"]):
+            has_end_marker = True
+
+        # 检测大标题(40pt+)
+        if shape_max_font >= 40 and is_top:
             has_big_title = True
             title_font_size = max(title_font_size, shape_max_font)
 
-        # 判断副标题（在标题下方、字号较小）
-        if has_big_title and is_top and shape_max_font < title_font_size and shape_max_font > 0:
-            has_subtitle = True
+        # 检测小标题(16-24pt，在页面中下部分)
+        if 16 <= shape_max_font <= 24 and not is_top:
+            small_title_count += 1
 
-        # 判断正文（位置偏下、文本较长或有多个段落）
-        is_bottom = top_cm > sh_cm * 0.3
-        text_len = len(text)
-        para_count = len(shape.text_frame.paragraphs)
-        if is_bottom and (text_len > 50 or para_count > 2):
+        # 检测正文标题(28pt左右)
+        if 24 <= shape_max_font <= 32:
             has_body = True
+
+        # 检测姓名/学号等字段
+        if any(kw in text for kw in ["姓名", "学号", "老师", "姓名："]):
+            has_subtitle = True
 
         shapes_info.append({
             "shape": shape,
@@ -225,39 +286,35 @@ def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
             "height": shape.height,
             "font_size": shape_max_font,
             "is_top": is_top,
-            "is_bottom": is_bottom,
-            "is_center": is_center,
-            "para_count": para_count,
+            "is_bottom": not is_top,
+            "is_center": left_cm > sw_cm * 0.2 and (left_cm + width_cm) < sw_cm * 0.8,
+            "para_count": len(shape.text_frame.paragraphs),
         })
 
-    # 判断slide类型
-    if has_big_title and not has_body:
-        if has_subtitle:
-            slide_type = "cover"
-        else:
-            slide_type = "cover"  # 也可能是section
-    elif has_big_title and has_body:
-        slide_type = "content"
-    elif has_body and not has_big_title:
+    # ── 判断slide类型 ──
+    if has_end_marker:
+        slide_type = "end"
+    elif has_toc_marker:
+        slide_type = "toc"
+    elif has_section_marker:
+        slide_type = "section"
+    elif has_big_title and has_image:
+        # 有大标题+图片 → 封面页
+        slide_type = "cover"
+    elif has_big_title and has_subtitle:
+        slide_type = "cover"
+    elif has_big_title and not has_body and not has_section_marker:
+        # 只有大标题没有正文 → 封面页
+        slide_type = "cover"
+    elif has_body or small_title_count >= 2:
         slide_type = "content"
     else:
         slide_type = "content"  # 默认
 
-    # 特殊判断结尾页（文字少、有"谢谢"等关键词）
-    all_text = " ".join(s["text"] for s in shapes_info)
-    end_keywords = ["谢谢", "感谢", "thank", "end", "结束", "聆听"]
-    if any(kw in all_text.lower() for kw in end_keywords):
-        slide_type = "end"
-
-    # 判断目录页
-    toc_keywords = ["目录", "contents", "目 录", "概览", "overview"]
-    if any(kw in all_text.lower() for kw in toc_keywords):
-        slide_type = "toc"
-
-    # 收集可填充的文本区域位置
+    # 收集可填充的文本区域
     text_areas = []
     for si in shapes_info:
-        if si["text"]:  # 有文本的区域
+        if si["text"]:
             text_areas.append({
                 "left": si["left"],
                 "top": si["top"],
@@ -275,6 +332,9 @@ def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
         "text_areas": text_areas,
         "has_big_title": has_big_title,
         "has_body": has_body,
+        "has_image": has_image,
+        "has_section_marker": has_section_marker,
+        "small_title_count": small_title_count,
         "max_font_size": max_font_size,
     }
 
