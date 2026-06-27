@@ -184,13 +184,13 @@ with st.sidebar:
 
     # 图片设置
     st.subheader("配图设置")
-    enable_images = st.checkbox("启用Unsplash配图", value=False,
-                                 help="需要Unsplash API Key")
+    enable_images = st.checkbox("启用Unsplash配图", value=True,
+                                 help="根据内容关键词自动搜索配图")
     unsplash_key = st.text_input(
         "Unsplash Access Key",
         type="password",
-        value="",
-        help="在 unsplash.com/developers 免费申请",
+        value="AerhhHr9KNc0kxSEzVj2q3mEdWBTh2bRmDfU9McNneI",
+        help="已预置默认Key，也可替换为自己的",
         disabled=not enable_images,
     )
 
