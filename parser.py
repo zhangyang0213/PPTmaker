@@ -18,6 +18,22 @@ class SlideContent:
     image_query: str = ""    # 配图搜索词
 
 
+def _clean_text(text: str) -> str:
+    """清理文本中的Markdown符号"""
+    # 去除加粗 **text** 或 __text__
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
+    text = re.sub(r'__(.+?)__', r'\1', text)
+    # 去除斜体 *text* 或 _text_（但保留列表项的 - 和 *）
+    text = re.sub(r'(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)', r'\1', text)
+    # 去除删除线 ~~text~~
+    text = re.sub(r'~~(.+?)~~', r'\1', text)
+    # 去除行内代码 `code`
+    text = re.sub(r'`(.+?)`', r'\1', text)
+    # 去除链接 [text](url)
+    text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', text)
+    return text.strip()
+
+
 def parse_markdown(text: str) -> List[SlideContent]:
     """解析Markdown文本，生成幻灯片内容列表
 
@@ -43,7 +59,7 @@ def parse_markdown(text: str) -> List[SlideContent]:
 
         # H1 → 封面页
         if line.startswith('# ') and not line.startswith('## '):
-            title = line[2:].strip()
+            title = _clean_text(line[2:].strip())
             subtitle = ""
             # 检查下一行是否为副标题
             j = i + 1
@@ -51,7 +67,7 @@ def parse_markdown(text: str) -> List[SlideContent]:
                 j += 1
             if j < len(lines) and not lines[j].startswith('#'):
                 # 下一行非空且非标题 → 作为副标题
-                next_line = lines[j].strip()
+                next_line = _clean_text(lines[j].strip())
                 if len(next_line) < 60:  # 短文本视为副标题
                     subtitle = next_line
                     j += 1
@@ -68,7 +84,7 @@ def parse_markdown(text: str) -> List[SlideContent]:
 
         # H2 → 章节页或内容页
         if line.startswith('## ') and not line.startswith('### '):
-            title = line[3:].strip()
+            title = _clean_text(line[3:].strip())
             # 收集该H2下的内容
             body_lines, bullet_items, consumed = _collect_body(lines, i + 1)
             i = i + 1 + consumed
@@ -89,7 +105,7 @@ def parse_markdown(text: str) -> List[SlideContent]:
 
         # H3 → 内容页
         if line.startswith('### ') and not line.startswith('#### '):
-            title = line[4:].strip()
+            title = _clean_text(line[4:].strip())
             body_lines, bullet_items, consumed = _collect_body(lines, i + 1)
             i = i + 1 + consumed
             chunks = _auto_paginate(title, body_lines, bullet_items, level=2)
@@ -98,7 +114,7 @@ def parse_markdown(text: str) -> List[SlideContent]:
 
         # H4 → 内容页
         if line.startswith('#### '):
-            title = line[5:].strip()
+            title = _clean_text(line[5:].strip())
             body_lines, bullet_items, consumed = _collect_body(lines, i + 1)
             i = i + 1 + consumed
             chunks = _auto_paginate(title, body_lines, bullet_items, level=3)
@@ -237,11 +253,11 @@ def _collect_body(lines: List[str], start: int) -> tuple:
             continue
         # 列表项
         if re.match(r'^[\-\*]\s', line):
-            bullet_items.append(re.sub(r'^[\-\*]\s*', '', line))
+            bullet_items.append(_clean_text(re.sub(r'^[\-\*]\s*', '', line)))
         elif re.match(r'^\d+[\.、)]\s', line):
-            bullet_items.append(re.sub(r'^\d+[\.、)]\s*', '', line))
+            bullet_items.append(_clean_text(re.sub(r'^\d+[\.、)]\s*', '', line)))
         else:
-            body_lines.append(line.strip())
+            body_lines.append(_clean_text(line.strip()))
         i += 1
 
     return body_lines, bullet_items, i - start
