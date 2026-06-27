@@ -4,6 +4,8 @@ import streamlit as st
 from io import BytesIO
 import time
 
+from pptx import Presentation
+
 from styles import STYLE_CATEGORIES, LAYOUT_NAMES, get_style_name, get_theme
 from parser import parse_markdown, parse_plain_text, extract_keywords, SlideContent
 from generator import create_presentation, export_to_bytes
@@ -32,37 +34,19 @@ st.markdown("""
         color: #888;
         margin-bottom: 2rem;
     }
-    .slide-preview {
-        background: #f8f9fa;
+    .success-box {
+        background: #d4edda;
         border-radius: 8px;
-        padding: 12px 16px;
-        margin: 6px 0;
-        border-left: 4px solid #4a90d9;
+        padding: 16px;
+        margin: 12px 0;
+        border-left: 4px solid #28a745;
     }
-    .slide-title {
-        font-weight: 600;
-        font-size: 1.05rem;
-        color: #333;
-    }
-    .slide-body {
-        color: #666;
-        font-size: 0.9rem;
-        margin-top: 4px;
-    }
-    .style-card {
-        padding: 8px 12px;
+    .info-box {
+        background: #e7f3ff;
         border-radius: 8px;
-        border: 2px solid #e0e0e0;
-        margin: 4px 0;
-        cursor: pointer;
-        transition: all 0.2s;
-    }
-    .style-card:hover {
-        border-color: #4a90d9;
-    }
-    .style-card.selected {
-        border-color: #4a90d9;
-        background: #f0f7ff;
+        padding: 16px;
+        margin: 12px 0;
+        border-left: 4px solid #007bff;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -142,9 +126,22 @@ AI已深入医疗、制造、教育、金融等多个领域，正在重塑产业
 通用人工智能的探索、人机协作新模式、伦理与安全的平衡，是AI未来发展的核心议题。"""
 
 
-# ── 主界面 ───────────────────────────────────────────────────
+# ── 初始化session_state ──────────────────────────────────────
+if "parsed" not in st.session_state:
+    st.session_state["parsed"] = False
+if "slides" not in st.session_state:
+    st.session_state["slides"] = []
+if "generated" not in st.session_state:
+    st.session_state["generated"] = False
+if "pptx_bytes" not in st.session_state:
+    st.session_state["pptx_bytes"] = None
+if "filename" not in st.session_state:
+    st.session_state["filename"] = ""
+if "template_prs" not in st.session_state:
+    st.session_state["template_prs"] = None
 
-# 标题
+
+# ── 主界面 ───────────────────────────────────────────────────
 st.markdown('<div class="main-title">🎬 智能PPT生成助手</div>', unsafe_allow_html=True)
 st.markdown('<div class="sub-title">输入大纲，一键生成精美幻灯片</div>', unsafe_allow_html=True)
 
@@ -165,19 +162,19 @@ with st.sidebar:
 
     # 显示风格预览色
     theme = get_theme(style_id)
-    cols = st.columns(5)
-    color_names = ["背景", "标题", "正文", "强调", "辅助"]
+    cols = st.columns(6)
+    color_names = ["背景", "渐变", "标题", "正文", "强调", "辅助"]
     color_values = [
-        theme["bg_color"], theme["title_color"], theme["body_color"],
-        theme["accent_color"], theme["accent2_color"]
+        theme["bg_color"], theme["bg_color2"], theme["title_color"],
+        theme["body_color"], theme["accent_color"], theme["accent2_color"]
     ]
     for i, (name, color) in enumerate(zip(color_names, color_values)):
         with cols[i]:
             hex_color = f"#{str(color)[0:2]}{str(color)[2:4]}{str(color)[4:6]}"
             st.markdown(
-                f'<div style="width:36px;height:36px;border-radius:6px;'
+                f'<div style="width:30px;height:30px;border-radius:6px;'
                 f'background:{hex_color};margin:0 auto;border:1px solid #ddd;"></div>'
-                f'<div style="text-align:center;font-size:10px;margin-top:2px;">{name}</div>',
+                f'<div style="text-align:center;font-size:9px;margin-top:2px;">{name}</div>',
                 unsafe_allow_html=True
             )
 
@@ -197,14 +194,27 @@ with st.sidebar:
 
     st.divider()
 
-    # 主题色自定义
-    st.subheader("自定义主题色")
-    custom_accent = st.color_picker("自定义强调色", value=None,
-                                     help="留空则使用风格默认色")
+    # 模板上传
+    st.subheader("上传PPT模板（可选）")
+    template_file = st.file_uploader(
+        "上传.pptx模板",
+        type=["pptx"],
+        help="上传你自己的PPT模板，将基于模板的布局生成新PPT",
+    )
+    if template_file is not None:
+        try:
+            template_bytes = template_file.read()
+            st.session_state["template_prs"] = Presentation(BytesIO(template_bytes))
+            st.success(f"模板已加载：{template_file.name}")
+        except Exception as e:
+            st.error(f"模板加载失败：{e}")
+            st.session_state["template_prs"] = None
+    else:
+        st.session_state["template_prs"] = None
 
     st.divider()
-    st.caption("智能PPT生成助手 v1.0")
-    st.caption("基于 python-pptx + Streamlit 构建")
+    st.caption("智能PPT生成助手 v2.0")
+    st.caption("8种风格 | 模板上传 | 一键切换")
 
 # ── 主区域：输入与生成 ───────────────────────────────────────
 
@@ -252,12 +262,10 @@ if st.button("🔍 解析大纲", type="primary", use_container_width=True):
             else:
                 slides = parse_plain_text(user_input)
 
-            # 提取关键词
             slides = extract_keywords(slides)
-
-            # 存入session
             st.session_state["slides"] = slides
             st.session_state["parsed"] = True
+            st.session_state["generated"] = False  # 重置生成状态
 
 # ── 解析结果预览 ─────────────────────────────────────────────
 if st.session_state.get("parsed") and st.session_state.get("slides"):
@@ -293,7 +301,18 @@ if st.session_state.get("parsed") and st.session_state.get("slides"):
     # ── 生成PPT ──────────────────────────────────────────────
     st.divider()
 
-    if st.button("🚀 生成PPTX文件", type="primary", use_container_width=True):
+    # 生成按钮
+    col_gen1, col_gen2 = st.columns([1, 1])
+    with col_gen1:
+        generate_btn = st.button("🚀 生成PPTX文件", type="primary", use_container_width=True)
+    with col_gen2:
+        # 如果已经生成过，显示切换重做按钮
+        if st.session_state.get("generated"):
+            switch_btn = st.button("🔄 切换风格重新生成", use_container_width=True)
+        else:
+            switch_btn = False
+
+    if generate_btn or switch_btn:
         with st.spinner("正在生成PPT，请稍候..."):
             try:
                 prs = create_presentation(
@@ -301,12 +320,10 @@ if st.session_state.get("parsed") and st.session_state.get("slides"):
                     style_id=style_id,
                     unsplash_key=unsplash_key if enable_images else "",
                     enable_images=enable_images,
+                    template_prs=st.session_state.get("template_prs"),
                 )
 
-                # 导出为字节流
                 pptx_bytes = export_to_bytes(prs)
-
-                # 生成文件名
                 style_name = get_style_name(style_id).replace(" ", "_")
                 filename = f"智能PPT_{style_name}_{len(slides)}页.pptx"
 
@@ -314,32 +331,73 @@ if st.session_state.get("parsed") and st.session_state.get("slides"):
                 st.session_state["filename"] = filename
                 st.session_state["generated"] = True
 
-                st.success(f"PPT生成成功！共 {len(slides)} 页幻灯片")
+                style_display = get_style_name(style_id)
+                st.markdown(
+                    f'<div class="success-box">'
+                    f'✅ <b>生成成功！</b>共 {len(slides)} 页幻灯片 | '
+                    f'风格：{style_display} | 文件大小：{len(pptx_bytes)//1024}KB'
+                    f'<br>💡 不满意？在左侧切换风格后点击 <b>🔄 切换风格重新生成</b>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
 
             except Exception as e:
                 st.error(f"生成失败：{e}")
                 import traceback
                 st.code(traceback.format_exc())
 
-    # 下载按钮
-    if st.session_state.get("generated"):
+    # ── 下载与预览区 ─────────────────────────────────────────
+    if st.session_state.get("generated") and st.session_state.get("pptx_bytes"):
+        st.divider()
+        st.subheader("📥 下载与预览")
+
         pptx_bytes = st.session_state["pptx_bytes"]
         filename = st.session_state["filename"]
 
-        st.download_button(
-            label="📥 下载PPTX文件",
-            data=pptx_bytes,
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            use_container_width=True,
-        )
+        col_dl1, col_dl2 = st.columns([2, 1])
 
-        st.info("下载后可用 PowerPoint / WPS / LibreOffice 打开编辑")
+        with col_dl1:
+            st.download_button(
+                label="📥 下载PPTX文件",
+                data=pptx_bytes,
+                file_name=filename,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                use_container_width=True,
+            )
+            st.info("下载后可用 PowerPoint / WPS / LibreOffice 打开编辑")
 
-# ── 初始化session_state ──────────────────────────────────────
-if "parsed" not in st.session_state:
-    st.session_state["parsed"] = False
-if "slides" not in st.session_state:
-    st.session_state["slides"] = []
-if "generated" not in st.session_state:
-    st.session_state["generated"] = False
+        with col_dl2:
+            # 显示当前风格信息
+            current_style = get_style_name(style_id)
+            st.markdown(
+                f'<div class="info-box">'
+                f'<b>当前风格</b><br>{current_style}<br><br>'
+                f'<b>幻灯片数</b><br>{len(slides)} 页<br><br>'
+                f'<b>文件大小</b><br>{len(pptx_bytes)//1024} KB'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+
+        # 快速切换风格提示
+        st.markdown("---")
+        st.markdown("#### 💡 快速切换风格")
+        st.markdown("在左侧边栏选择新风格，然后点击 **🔄 切换风格重新生成** 即可，无需重新输入大纲。")
+
+        # 风格快速预览卡片
+        preview_cols = st.columns(4)
+        for i, (sid, scat) in enumerate(STYLE_CATEGORIES.items()):
+            with preview_cols[i % 4]:
+                t = get_theme(sid)
+                bg_hex = f"#{str(t['bg_color'])[0:2]}{str(t['bg_color'])[2:4]}{str(t['bg_color'])[4:6]}"
+                accent_hex = f"#{str(t['accent_color'])[0:2]}{str(t['accent_color'])[2:4]}{str(t['accent_color'])[4:6]}"
+                is_current = "✅ " if sid == style_id else ""
+                st.markdown(
+                    f'<div style="padding:8px;border-radius:8px;border:2px solid '
+                    f'{"#28a745" if sid == style_id else "#e0e0e0"};'
+                    f'background:{bg_hex};margin:4px 0;">'
+                    f'<div style="font-size:12px;color:{accent_hex};font-weight:bold;">'
+                    f'{is_current}{scat["name"]}</div>'
+                    f'<div style="font-size:9px;color:#666;">{scat["desc"]}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
