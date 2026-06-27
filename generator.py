@@ -664,11 +664,81 @@ def _add_textbox_to_slide(slide, text, color, size, font_name,
 #  预览功能 - 生成幻灯片缩略图
 # ══════════════════════════════════════════════════════════════
 
-def generate_preview_images(prs: Presentation) -> List[bytes]:
-    """生成PPT每页的预览图(PNG)
+def _find_chinese_font() -> str:
+    """自动查找系统中可用的中文字体路径"""
+    import platform
+    import os
 
-    使用Pillow绘制简化的幻灯片预览
-    """
+    system = platform.system()
+
+    # 候选字体列表
+    candidates = []
+    if system == "Windows":
+        font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        candidates = [
+            os.path.join(font_dir, "msyh.ttc"),      # 微软雅黑
+            os.path.join(font_dir, "msyhbd.ttc"),     # 微软雅黑粗体
+            os.path.join(font_dir, "simhei.ttf"),     # 黑体
+            os.path.join(font_dir, "simsun.ttc"),     # 宋体
+            os.path.join(font_dir, "simfang.ttf"),    # 仿宋
+        ]
+    elif system == "Darwin":  # macOS
+        candidates = [
+            "/System/Library/Fonts/PingFang.ttc",
+            "/Library/Fonts/Arial Unicode.ttf",
+            "/System/Library/Fonts/STHeiti Light.ttc",
+        ]
+    else:  # Linux
+        candidates = [
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ]
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    # fallback: 搜索常见中文字体文件名
+    if system == "Windows":
+        font_dir = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        if os.path.exists(font_dir):
+            for fname in os.listdir(font_dir):
+                if fname.lower().endswith(('.ttf', '.ttc', '.otf')):
+                    if any(kw in fname.lower() for kw in ['msyh', 'simhei', 'simsun', 'simfang', 'yahei']):
+                        return os.path.join(font_dir, fname)
+
+    return ""
+
+
+# 缓存字体路径
+_cached_font_path = None
+
+def _get_chinese_font(font_size: int):
+    """获取支持中文的Pillow字体"""
+    from PIL import ImageFont
+
+    global _cached_font_path
+    if _cached_font_path is None:
+        _cached_font_path = _find_chinese_font()
+
+    if _cached_font_path:
+        try:
+            return ImageFont.truetype(_cached_font_path, font_size)
+        except Exception:
+            pass
+
+    # 最终fallback
+    try:
+        return ImageFont.truetype("arial.ttf", font_size)
+    except:
+        return ImageFont.load_default()
+
+
+def generate_preview_images(prs: Presentation) -> List[bytes]:
+    """生成PPT每页的预览图(PNG) - 支持中文"""
     try:
         from PIL import Image, ImageDraw, ImageFont
         HAS_PIL = True
@@ -680,17 +750,15 @@ def generate_preview_images(prs: Presentation) -> List[bytes]:
         return []
 
     previews = []
-    # 预览图尺寸
-    PREVIEW_W = 640
-    PREVIEW_H = 360
+    PREVIEW_W = 960
+    PREVIEW_H = 540
 
     for slide in prs.slides:
-        # 创建白色背景图
         img = Image.new('RGB', (PREVIEW_W, PREVIEW_H), (255, 255, 255))
         draw = ImageDraw.Draw(img)
 
-        # 缩放比例
-        sx = PREVIEW_W / (prs.slide_width / 914400)  # EMU to inch, then to px
+        # 缩放比例: EMU -> cm -> px
+        sx = PREVIEW_W / (prs.slide_width / 914400)
         sy = PREVIEW_H / (prs.slide_height / 914400)
         s = min(sx, sy)
 
@@ -709,8 +777,8 @@ def generate_preview_images(prs: Presentation) -> List[bytes]:
         for shape in slide.shapes:
             left = int(shape.left / 914400 * s)
             top = int(shape.top / 914400 * s)
-            width = int(shape.width / 914400 * s)
-            height = int(shape.height / 914400 * s)
+            width = max(1, int(shape.width / 914400 * s))
+            height = max(1, int(shape.height / 914400 * s))
 
             # 绘制形状背景
             try:
@@ -724,46 +792,44 @@ def generate_preview_images(prs: Presentation) -> List[bytes]:
             # 绘制文本
             if shape.has_text_frame:
                 text = shape.text_frame.text.strip()
-                if text:
-                    # 确定字号
-                    font_size = 12
-                    try:
-                        for para in shape.text_frame.paragraphs:
-                            for run in para.runs:
-                                if run.font.size:
-                                    font_size = max(font_size, int(run.font.size.pt * s * 0.15))
-                    except:
-                        pass
-                    font_size = max(8, min(font_size, 24))
+                if not text:
+                    continue
 
-                    try:
-                        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
-                    except:
-                        font = ImageFont.load_default()
+                # 确定字号
+                font_size = 14
+                try:
+                    for para in shape.text_frame.paragraphs:
+                        for run in para.runs:
+                            if run.font.size:
+                                font_size = max(font_size, int(run.font.size.pt * s * 0.13))
+                except:
+                    pass
+                font_size = max(10, min(font_size, 28))
 
-                    # 确定文字颜色
-                    text_color = (50, 50, 50)
-                    try:
-                        for para in shape.text_frame.paragraphs:
-                            for run in para.runs:
-                                if run.font.color and run.font.color.rgb:
-                                    c = run.font.color.rgb
-                                    text_color = (c[0], c[1], c[2])
-                                    break
-                    except:
-                        pass
+                font = _get_chinese_font(font_size)
 
-                    # 截断过长文本
-                    display_text = text[:80] + ("..." if len(text) > 80 else "")
-                    # 多行文本只取前几行
-                    lines = display_text.split('\n')
-                    display_lines = '\n'.join(lines[:5])
-                    if len(lines) > 5:
-                        display_lines += "..."
+                # 确定文字颜色
+                text_color = (50, 50, 50)
+                try:
+                    for para in shape.text_frame.paragraphs:
+                        for run in para.runs:
+                            if run.font.color and run.font.color.rgb:
+                                c = run.font.color.rgb
+                                text_color = (c[0], c[1], c[2])
+                                break
+                except:
+                    pass
 
-                    draw.text((left + 4, top + 2), display_lines, fill=text_color, font=font)
+                # 逐行绘制，支持多行
+                lines = text.split('\n')
+                max_lines = max(1, height // (font_size + 6))
+                y_offset = 0
+                for line_idx, line in enumerate(lines[:max_lines]):
+                    display_line = line[:60] + ("..." if len(line) > 60 else "")
+                    draw.text((left + 4, top + 2 + y_offset), display_line,
+                              fill=text_color, font=font)
+                    y_offset += font_size + 4
 
-        # 转为PNG bytes
         buf = BytesIO()
         img.save(buf, format='PNG')
         buf.seek(0)
