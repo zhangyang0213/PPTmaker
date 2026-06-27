@@ -8,7 +8,7 @@ from pptx import Presentation
 
 from styles import STYLE_CATEGORIES, LAYOUT_NAMES, get_style_name, get_theme
 from parser import parse_markdown, parse_plain_text, extract_keywords, SlideContent
-from generator import create_presentation, export_to_bytes, generate_preview_html
+from generator import create_presentation, export_to_bytes
 from image_search import UnsplashSearcher
 
 st.set_page_config(
@@ -316,13 +316,9 @@ if st.session_state.get("parsed") and st.session_state.get("slides"):
                 style_name = "导入模板" if use_template else get_style_name(style_id)
                 filename = f"智能PPT_{style_name}_{len(slides)}页.pptx"
 
-                # 生成HTML预览
-                preview_html = generate_preview_html(prs)
-
                 st.session_state["pptx_bytes"] = pptx_bytes
                 st.session_state["filename"] = filename
                 st.session_state["generated"] = True
-                st.session_state["preview_html"] = preview_html
 
                 st.markdown(
                     f'<div class="success-box">'
@@ -337,20 +333,8 @@ if st.session_state.get("parsed") and st.session_state.get("slides"):
                 import traceback
                 st.code(traceback.format_exc())
 
-    # ── 预览与下载区 ──
+    # ── 下载区 ──
     if st.session_state.get("generated") and st.session_state.get("pptx_bytes"):
-        st.divider()
-        st.subheader("👀 在线预览")
-
-        pptx_bytes = st.session_state["pptx_bytes"]
-        filename = st.session_state["filename"]
-        preview_html = st.session_state.get("preview_html", "")
-
-        # HTML预览
-        if preview_html:
-            st.markdown(preview_html, unsafe_allow_html=True)
-        else:
-            st.info("预览生成失败，请下载后查看")
 
         st.divider()
         st.subheader("📥 下载文件")

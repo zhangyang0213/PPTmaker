@@ -136,7 +136,14 @@ def _create_from_template(
     if not end_candidates:
         end_candidates = cover_candidates
 
-    # ── 步骤3: 构建内容→模板slide映射 ──
+    # ── 步骤3: 收集所有章节名称（用于侧边目录） ──
+    all_section_names = []
+    for sd in slides:
+        if sd.layout == "section" or (sd.layout == "content" and sd.level <= 1):
+            if sd.title and sd.title not in all_section_names:
+                all_section_names.append(sd.title)
+
+    # ── 步骤4: 构建内容→模板slide映射 ──
     # 将我们的内容slides分配到模板slides
     mapping = []  # [(content_slide, template_slide_index)]
     content_idx = 0
@@ -161,7 +168,7 @@ def _create_from_template(
     # ── 步骤4: 替换模板slide中的文本 ──
     for content_sd, tmpl_idx in mapping:
         slide = prs.slides[tmpl_idx]
-        _replace_text_in_slide(slide, content_sd, theme)
+        _replace_text_in_slide(slide, content_sd, theme, all_section_names)
 
     # ── 步骤5: 如果内容页比模板正文页多，添加额外的slide ──
     # (通过复制最后一个正文页模板slide)
@@ -196,14 +203,22 @@ def _create_from_template(
     return prs
 
 
-def _replace_text_in_slide(slide, data: SlideContent, theme: dict):
+def _replace_text_in_slide(slide, data: SlideContent, theme: dict,
+                           all_section_names: list = None):
     """只替换slide中的文本内容，保留所有格式、图片、装饰不变
     
-    策略：遍历所有shape，找到有文本的，按位置和字号判断其角色
-    （标题/副标题/正文/列表项），然后填入对应内容。
-    不删除任何shape，不修改任何非文本属性。
+    关键理解：
+    - 封面页：最大文本→标题，其次→副标题/姓名等
+    - 目录页：小号***是目录标题(22pt)，大号01/02/03/04是编号(66pt)
+    - 章节分隔页：大号编号保留，次大文本→章节标题
+    - 正文页：左侧0-1.7cm的小文本是侧边目录，2.2cm后是正文标题
+    - 结尾页：最大文本→结束语
+    
+    只修改run.text属性，不改font/color/size。
     """
-    # 收集所有有文本的shape，按字号从大到小排序
+    if all_section_names is None:
+        all_section_names = []
+    # 收集所有有文本的shape
     text_shapes = []
     for shape in slide.shapes:
         if not shape.has_text_frame:
@@ -218,87 +233,100 @@ def _replace_text_in_slide(slide, data: SlideContent, theme: dict):
                 if run.font.size:
                     max_font = max(max_font, run.font.size.pt)
         
+        left_cm = shape.left / 914400
+        
         text_shapes.append({
             "shape": shape,
             "text": text,
             "font_size": max_font,
             "top": shape.top,
             "left": shape.left,
+            "left_cm": left_cm,
         })
-
-    # 按字号从大到小排序
-    text_shapes.sort(key=lambda x: -x["font_size"])
 
     layout = data.layout
     items = data.bullet_items if data.bullet_items else data.body_lines
 
     if layout == "title":
-        # 封面页：最大的文本框→标题，其次→副标题，其余清空
-        for i, ts in enumerate(text_shapes):
-            shape = ts["shape"]
+        # 封面页：按字号排序，最大→标题，其次→副标题
+        sorted_shapes = sorted(text_shapes, key=lambda x: -x["font_size"])
+        for i, ts in enumerate(sorted_shapes):
             if i == 0:
-                # 标题
-                _set_shape_text(shape, data.title)
+                _set_shape_text(ts["shape"], data.title)
             elif i == 1 and data.subtitle:
-                # 副标题
-                _set_shape_text(shape, data.subtitle)
+                _set_shape_text(ts["shape"], data.subtitle)
             else:
-                # 其他文本框清空
-                _set_shape_text(shape, "")
+                _set_shape_text(ts["shape"], "")
 
     elif layout == "section":
-        # 章节页：最大的→章节编号(保留)，次大的→章节标题
-        for i, ts in enumerate(text_shapes):
-            shape = ts["shape"]
+        # 章节分隔页：最大→编号(保留)，次大→章节标题
+        sorted_shapes = sorted(text_shapes, key=lambda x: -x["font_size"])
+        for i, ts in enumerate(sorted_shapes):
             if i == 0:
-                # 大号编号，保留原样或设为章节号
-                pass  # 保留模板的装饰性编号
+                # 大号编号，保留模板原始内容
+                pass
             elif i == 1:
                 # 章节标题
-                _set_shape_text(shape, data.title)
+                _set_shape_text(ts["shape"], data.title)
             else:
-                _set_shape_text(shape, "")
+                _set_shape_text(ts["shape"], "")
 
     elif layout == "toc":
-        # 目录页：按位置排列的文本框填入目录项
-        toc_items = data.bullet_items if data.bullet_items else []
-        # 按位置（从左到右、从上到下）排序目录项文本框
-        toc_shapes = sorted(text_shapes, key=lambda x: (x["top"], x["left"]))
+        # 目录页：按位置(从上到下、从左到右)排序
+        # 小号文本(22pt的***)→目录标题，大号编号(66pt)→保留
+        sorted_shapes = sorted(text_shapes, key=lambda x: (x["font_size"] > 40, x["top"], x["left"]))
         
-        item_idx = 0
-        for i, ts in enumerate(toc_shapes):
-            shape = ts["shape"]
-            if item_idx < len(toc_items):
-                _set_shape_text(shape, toc_items[item_idx])
-                item_idx += 1
+        toc_items = data.bullet_items if data.bullet_items else []
+        toc_idx = 0
+        for ts in sorted_shapes:
+            if ts["font_size"] > 40:
+                # 大号编号，保留
+                continue
             else:
-                _set_shape_text(shape, "")
+                # 小号文本→目录标题
+                if toc_idx < len(toc_items):
+                    _set_shape_text(ts["shape"], toc_items[toc_idx])
+                    toc_idx += 1
+                else:
+                    _set_shape_text(ts["shape"], "")
 
     elif layout == "end":
-        # 结尾页：最大文本框→结束语
-        for i, ts in enumerate(text_shapes):
-            shape = ts["shape"]
+        # 结尾页：最大文本→结束语
+        sorted_shapes = sorted(text_shapes, key=lambda x: -x["font_size"])
+        for i, ts in enumerate(sorted_shapes):
             if i == 0:
-                _set_shape_text(shape, data.title)
+                _set_shape_text(ts["shape"], data.title)
             else:
-                _set_shape_text(shape, "")
+                _set_shape_text(ts["shape"], "")
 
     else:
-        # 正文内容页：按字号和位置分配
-        # 最大→标题，其余→正文要点
+        # 正文内容页
+        # 分成两组：左侧(0-1.7cm)是侧边目录，右侧(2.2cm+)是正文区
+        sidebar_shapes = [ts for ts in text_shapes if ts["left_cm"] < 2.0]
+        content_shapes = [ts for ts in text_shapes if ts["left_cm"] >= 2.0]
+        
+        # 侧边目录：填入各章节名
+        sidebar_sorted = sorted(sidebar_shapes, key=lambda x: x["top"])
+        for i, ts in enumerate(sidebar_sorted):
+            if i < len(all_section_names):
+                _set_shape_text(ts["shape"], all_section_names[i])
+            else:
+                _set_shape_text(ts["shape"], "")
+        
+        # 正文区：按字号排序，最大→标题，其余→正文要点
+        content_sorted = sorted(content_shapes, key=lambda x: -x["font_size"])
         content_idx = 0
-        for i, ts in enumerate(text_shapes):
-            shape = ts["shape"]
+        for i, ts in enumerate(content_sorted):
             if i == 0:
                 # 标题
-                _set_shape_text(shape, data.title)
+                _set_shape_text(ts["shape"], data.title)
             else:
                 # 正文要点
                 if content_idx < len(items):
-                    _set_shape_text(shape, items[content_idx])
+                    _set_shape_text(ts["shape"], items[content_idx])
                     content_idx += 1
                 else:
-                    _set_shape_text(shape, "")
+                    _set_shape_text(ts["shape"], "")
 
 
 def _set_shape_text(shape, new_text: str):
