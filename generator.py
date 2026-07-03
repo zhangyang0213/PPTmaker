@@ -774,9 +774,11 @@ def _resolve_scheme_colors(slide, theme_colors: dict):
 
 def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
     """复制模板slide到新演示文稿（包括背景、layout形状、图片和形状）
-    关键：将schemeClr(主题色引用)解析为srgbClr(显式RGB)，
-    防止新PPT的主题色方案与模板不同导致颜色错乱。
-    同时复制layout上的shape（如正文页左侧红色矩形）。
+    关键修复：
+    1. 所有shape用deepcopy XML保留完整格式（裁剪/缩放/偏移），图片不变形
+    2. 图片数据通过关系复制，修复跨演示文稿图片引用
+    3. 将schemeClr(主题色引用)解析为srgbClr(显式RGB)
+    4. 复制layout上的shape（如正文页左侧红色矩形）
     """
     import copy
 
@@ -788,10 +790,8 @@ def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
     new_cSld = new_slide._element.find(qn('p:cSld'))
 
     bg_to_copy = None
-    # 1. slide自身的背景
     if src_cSld is not None:
         bg_to_copy = src_cSld.find(qn('p:bg'))
-    # 2. layout的背景
     if bg_to_copy is None:
         try:
             layout_cSld = source_slide.slide_layout._element.find(qn('p:cSld'))
@@ -799,7 +799,6 @@ def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
                 bg_to_copy = layout_cSld.find(qn('p:bg'))
         except:
             pass
-    # 3. master的背景
     if bg_to_copy is None:
         try:
             master_cSld = source_slide.slide_layout.slide_master._element.find(qn('p:cSld'))
@@ -814,43 +813,71 @@ def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
             new_cSld.remove(new_bg)
         new_cSld.insert(0, copy.deepcopy(bg_to_copy))
 
-    # ── 先复制layout上的shape（如正文页左侧红色矩形）──
-    try:
-        for shape in source_slide.slide_layout.shapes:
-            try:
-                img_blob = shape.image.blob
-                img_stream = BytesIO(img_blob)
-                new_slide.shapes.add_picture(
-                    img_stream, shape.left, shape.top, shape.width, shape.height
-                )
-                continue
-            except:
-                pass
-            el = copy.deepcopy(shape._element)
-            new_slide.shapes._spTree.append(el)
-    except Exception:
-        pass
+    # ── 复制layout和slide的shape（deepcopy保留图片裁剪/缩放）──
+    _copy_shapes(source_slide.slide_layout.shapes, new_slide)
+    _copy_shapes(source_slide.shapes, new_slide)
 
-    # ── 再复制slide自身的shape（图片用add_picture，其余deepcopy XML）──
-    for shape in source_slide.shapes:
-        try:
-            img_blob = shape.image.blob
-            img_stream = BytesIO(img_blob)
-            new_slide.shapes.add_picture(
-                img_stream, shape.left, shape.top, shape.width, shape.height
-            )
-            continue
-        except:
-            pass
-        el = copy.deepcopy(shape._element)
-        new_slide.shapes._spTree.append(el)
+    # ── 修复图片数据：deepcopy XML后图片引用指向源文件，需重新绑定 ──
+    _fix_copied_images(new_slide, source_slide, source_prs)
 
-    # ── 解析主题色：将所有schemeClr转为srgbClr，防止颜色错乱 ──
+    # ── 解析主题色：将所有schemeClr转为srgbClr ──
     theme_colors = _get_theme_colors(source_prs)
     if theme_colors:
         _resolve_scheme_colors(new_slide, theme_colors)
 
     return new_slide
+
+
+def _copy_shapes(shapes, new_slide):
+    """复制shape列表到新slide，deepcopy XML保留完整格式（裁剪/缩放/偏移/填充）"""
+    import copy
+    for shape in shapes:
+        el = copy.deepcopy(shape._element)
+        new_slide.shapes._spTree.append(el)
+
+
+def _fix_copied_images(new_slide, source_slide, source_prs):
+    """修复deepcopy后的图片：将源演示文稿的图片数据复制到新slide的关联中
+    需要同时处理来自slide自身和来自layout的图片引用。
+    """
+    import copy
+
+    new_slide_part = new_slide.part
+    p_ns = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+    a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    r_ns = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+    # 收集源slide和layout的所有图片关联
+    source_image_rels = {}
+    try:
+        for rId, rel in source_slide.part.rels.items():
+            if 'image' in rel.reltype:
+                source_image_rels[rId] = rel.target_part
+    except:
+        pass
+    try:
+        for rId, rel in source_slide.slide_layout.part.rels.items():
+            if 'image' in rel.reltype and rId not in source_image_rels:
+                source_image_rels[rId] = rel.target_part
+    except:
+        pass
+
+    # 查找新slide中所有a:blip元素（图片引用），无论其在p:blipFill还是a:blipFill中
+    for blip in new_slide._element.findall(f'.//{{{a_ns}}}blip'):
+        r_embed = blip.get(f'{{{r_ns}}}embed')
+        if r_embed is None:
+            continue
+
+        try:
+            source_image_part = source_image_rels.get(r_embed)
+            if source_image_part is None:
+                continue
+            img_blob = source_image_part.blob
+            img_stream = BytesIO(img_blob)
+            new_image_part, new_rId = new_slide_part.get_or_add_image_part(img_stream)
+            blip.set(f'{{{r_ns}}}embed', new_rId)
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════
