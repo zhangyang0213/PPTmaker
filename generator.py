@@ -577,24 +577,105 @@ def _analyze_template_slide(slide, sw: int, sh: int) -> dict:
     }
 
 
+def _get_theme_colors(prs: Presentation) -> dict:
+    """从模板演示文稿中提取主题颜色映射表 {scheme_name: #RRGGBB}
+    包含XML中使用的别名映射(tx1→dk1, bg1→lt1等)
+    """
+    try:
+        master = prs.slide_masters[0]
+        for rel in master.part.rels.values():
+            if 'theme' in rel.reltype:
+                theme_xml = etree.fromstring(rel.target_part.blob)
+                ns = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
+                clr_scheme = theme_xml.find('.//a:clrScheme', ns)
+                if clr_scheme is None:
+                    return {}
+                colors = {}
+                for child in clr_scheme:
+                    tag = child.tag.split('}')[-1]
+                    for color_elem in child:
+                        color_tag = color_elem.tag.split('}')[-1]
+                        if color_tag == 'srgbClr':
+                            colors[tag] = color_elem.get('val', '')
+                        elif color_tag == 'sysClr':
+                            val = color_elem.get('lastClr', '')
+                            if val:
+                                colors[tag] = val
+                # 添加XML中常用的别名映射
+                # tx1/dk1 都是深色文字, lt1/bg1 都是浅色背景
+                alias_map = {
+                    'tx1': colors.get('dk1', '000000'),
+                    'tx2': colors.get('dk2', '44546A'),
+                    'bg1': colors.get('lt1', 'FFFFFF'),
+                    'bg2': colors.get('lt2', 'E7E6E6'),
+                }
+                colors.update(alias_map)
+                return colors
+    except Exception:
+        pass
+    return {}
+
+
+def _resolve_scheme_colors(slide, theme_colors: dict):
+    """将slide中所有a:schemeClr替换为a:srgbClr，防止新PPT主题色不同导致颜色错乱"""
+    a_ns = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+    # 查找slide XML中所有schemeClr元素
+    for scheme_clr in slide._element.findall(f'.//{{{a_ns}}}schemeClr'):
+        val = scheme_clr.get('val', '')
+        if val in theme_colors:
+            rgb_val = theme_colors[val]
+            # 创建srgbClr替代schemeClr
+            parent = scheme_clr.getparent()
+            srgb_clr = etree.SubElement(parent, f'{{{a_ns}}}srgbClr')
+            srgb_clr.set('val', rgb_val)
+            # 保留子元素（如alpha透明度）
+            for child in list(scheme_clr):
+                srgb_clr.append(child)
+            parent.remove(scheme_clr)
+
+
 def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
-    """复制模板slide到新演示文稿（包括背景、图片和形状）"""
+    """复制模板slide到新演示文稿（包括背景、图片和形状）
+    关键：将schemeClr(主题色引用)解析为srgbClr(显式RGB)，
+    防止新PPT的主题色方案与模板不同导致颜色错乱。
+    """
     import copy
 
     blank_layout = prs.slide_layouts[6]
     new_slide = prs.slides.add_slide(blank_layout)
 
-    # 复制背景XML元素
+    # ── 复制背景：先检查slide自身，再检查layout，再检查master ──
     src_cSld = source_slide._element.find(qn('p:cSld'))
     new_cSld = new_slide._element.find(qn('p:cSld'))
-    if src_cSld is not None and new_cSld is not None:
-        src_bg = src_cSld.find(qn('p:bg'))
-        if src_bg is not None:
-            new_bg = new_cSld.find(qn('p:bg'))
-            if new_bg is not None:
-                new_cSld.remove(new_bg)
-            new_cSld.insert(0, copy.deepcopy(src_bg))
 
+    bg_to_copy = None
+    # 1. slide自身的背景
+    if src_cSld is not None:
+        bg_to_copy = src_cSld.find(qn('p:bg'))
+    # 2. layout的背景
+    if bg_to_copy is None:
+        try:
+            layout_cSld = source_slide.slide_layout._element.find(qn('p:cSld'))
+            if layout_cSld is not None:
+                bg_to_copy = layout_cSld.find(qn('p:bg'))
+        except:
+            pass
+    # 3. master的背景
+    if bg_to_copy is None:
+        try:
+            master_cSld = source_slide.slide_layout.slide_master._element.find(qn('p:cSld'))
+            if master_cSld is not None:
+                bg_to_copy = master_cSld.find(qn('p:bg'))
+        except:
+            pass
+
+    if bg_to_copy is not None and new_cSld is not None:
+        new_bg = new_cSld.find(qn('p:bg'))
+        if new_bg is not None:
+            new_cSld.remove(new_bg)
+        new_cSld.insert(0, copy.deepcopy(bg_to_copy))
+
+    # ── 复制所有shape（图片用add_picture，其余deepcopy XML）──
     for shape in source_slide.shapes:
         try:
             img_blob = shape.image.blob
@@ -607,6 +688,11 @@ def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
             pass
         el = copy.deepcopy(shape._element)
         new_slide.shapes._spTree.append(el)
+
+    # ── 解析主题色：将所有schemeClr转为srgbClr，防止颜色错乱 ──
+    theme_colors = _get_theme_colors(source_prs)
+    if theme_colors:
+        _resolve_scheme_colors(new_slide, theme_colors)
 
     return new_slide
 
