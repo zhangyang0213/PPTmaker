@@ -196,6 +196,7 @@ def _create_from_template(
     for slide_type, data, tmpl_idx, sec_num in slide_plan:
         source_slide = template_prs.slides[tmpl_idx]
         new_slide = _clone_slide(new_prs, source_slide, template_prs)
+        # 替换为用户内容
         if slide_type == "cover":
             _replace_cover_text(new_slide, data, theme)
         elif slide_type == "toc":
@@ -206,6 +207,8 @@ def _create_from_template(
             _replace_content_text(new_slide, data, theme, all_section_names, sec_num, sw, sh)
         elif slide_type == "end":
             _replace_end_text(new_slide, data, theme)
+        # 清除layout/master上的残留占位符文字
+        _clear_stale_text(new_slide)
 
     # ── 步骤6: 添加页码（动态定位到右下角）──
     sw_cm = sw / EMU_PER_CM
@@ -282,61 +285,196 @@ def _collect_text_shapes(slide):
 
 
 def _replace_cover_text(slide, data: SlideContent, theme: dict):
-    """封面页：最大文本→标题，其余文本框按top位置填入副标题行，清空多余"""
-    text_shapes = _collect_text_shapes(slide)
-    sorted_by_font = sorted(text_shapes, key=lambda x: -x["font_size"])
+    """封面页：主标题填入最大字号shape，副标题行智能匹配到模板对应框"""
+    # 收集所有文本shape
+    all_shapes = []
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        text = shape.text_frame.text.strip()
+        if not text:
+            continue
 
-    if not sorted_by_font:
+        max_font = 0
+        for para in shape.text_frame.paragraphs:
+            for run in para.runs:
+                if run.font.size:
+                    max_font = max(max_font, run.font.size.pt)
+
+        is_ph = False
+        try:
+            ph = shape._element.find('.//' + qn('p:ph'))
+            if ph is not None:
+                is_ph = True
+        except:
+            pass
+
+        all_shapes.append({
+            "shape": shape,
+            "text": text,
+            "font_size": max_font,
+            "top": shape.top,
+            "left": shape.left,
+            "width": shape.width,
+            "height": shape.height,
+            "is_placeholder": is_ph,
+        })
+
+    if not all_shapes:
         return
 
-    # 最大→主标题
-    _set_shape_text(sorted_by_font[0]["shape"], data.title)
+    # 1. 找最大字号shape填入主标题（通常是placeholder的40pt标题框）
+    all_sorted = sorted(all_shapes, key=lambda x: -x["font_size"])
+    _set_shape_text(all_sorted[0]["shape"], data.title)
+    title_shape = all_sorted[0]["shape"]
 
-    # 剩余文本框按top位置排序，依次填入副标题行
-    remaining = sorted_by_font[1:]
-    remaining_by_top = sorted(remaining, key=lambda x: x["top"])
-
-    # 将副标题按换行拆分
+    # 2. 副标题行智能匹配：根据模板框的文本前缀匹配用户输入
     subtitle_lines = data.subtitle.split("\n") if data.subtitle else []
-
-    for i, ts in enumerate(remaining_by_top):
-        if i < len(subtitle_lines):
-            _set_shape_text(ts["shape"], subtitle_lines[i])
+    
+    # 建立前缀匹配映射：模板框前缀 → 用户副标题行
+    prefix_map = {
+        "姓": None, "姓名": None, "姓    名": None,
+        "学": None, "学号": None, "学    号": None,
+        "老": None, "老师": None, "老    师": None,
+    }
+    
+    # 为每个用户副标题行确定其类型
+    typed_lines = []  # [(prefix_type, full_text)]
+    for line in subtitle_lines:
+        line_stripped = line.replace(" ", "")
+        if line_stripped.startswith("姓") or line_stripped.startswith("姓名"):
+            typed_lines.append(("name", line))
+        elif line_stripped.startswith("学") or line_stripped.startswith("学号"):
+            typed_lines.append(("sid", line))
+        elif line_stripped.startswith("老") or line_stripped.startswith("老师"):
+            typed_lines.append(("teacher", line))
         else:
-            _set_shape_text(ts["shape"], "")
+            typed_lines.append(("other", line))
+
+    # 3. 对非标题的shape，根据其原始文本前缀匹配填入
+    remaining = [ts for ts in all_shapes if ts["shape"] != title_shape]
+    
+    for ts in remaining:
+        orig_text = ts["text"].replace(" ", "")
+        matched = False
+        
+        # 尝试匹配模板框的前缀
+        if orig_text.startswith("姓") or orig_text.startswith("姓名"):
+            for i, (ptype, ptext) in enumerate(typed_lines):
+                if ptype == "name":
+                    _set_shape_text(ts["shape"], ptext)
+                    typed_lines.pop(i)
+                    matched = True
+                    break
+        elif orig_text.startswith("学") or orig_text.startswith("学号"):
+            for i, (ptype, ptext) in enumerate(typed_lines):
+                if ptype == "sid":
+                    _set_shape_text(ts["shape"], ptext)
+                    typed_lines.pop(i)
+                    matched = True
+                    break
+        elif orig_text.startswith("老") or orig_text.startswith("老师"):
+            for i, (ptype, ptext) in enumerate(typed_lines):
+                if ptype == "teacher":
+                    _set_shape_text(ts["shape"], ptext)
+                    typed_lines.pop(i)
+                    matched = True
+                    break
+        
+        if not matched:
+            # 未匹配的框：如果有剩余副标题行则填入，否则清空
+            if ts["is_placeholder"]:
+                _set_shape_text(ts["shape"], "")
+            elif typed_lines:
+                _set_shape_text(ts["shape"], typed_lines.pop(0)[1])
+            else:
+                _set_shape_text(ts["shape"], "")
+
+
+def _clear_stale_text(slide):
+    """清除slide中来自layout/master的残留占位符文字
+    （如'单击此处编辑母版标题样式'等）。
+    只清除placeholder类型的shape或包含特定占位符关键词的文本。
+    注意：在文本替换之后调用，避免误删已填入的用户内容。
+    """
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        text = shape.text_frame.text.strip()
+        if not text:
+            continue
+
+        # 检查是否包含模板占位符特征文字
+        stale_keywords = [
+            "单击此处编辑", "母版标题样式", "母版副标题样式",
+            "母版文本样式",
+        ]
+        has_stale = any(kw in text for kw in stale_keywords)
+
+        if has_stale:
+            _set_shape_text(shape, "")
 
 
 def _replace_toc_text(slide, data: SlideContent, theme: dict,
                        all_section_names: list):
-    """目录页：保留"目录"/"CONTENTS"和大号编号，小号文本框按位置填入章节名称"""
+    """目录页：保留"目录"/"CONTENTS"，大号编号更新序号，小号文本框填入章节名称
+    当章节数超过模板目录位置数时，在小号框内用换行合并显示多个章节名。
+    """
     text_shapes = _collect_text_shapes(slide)
 
-    # 分三类：目录标题（含"目录"/"CONTENTS"）、大号编号（>40pt）、小号文本
+    # 分三类：目录标题、大号编号(>40pt)、小号文本(≤40pt且非标题)
     title_shapes = [ts for ts in text_shapes if any(kw in ts["text"] for kw in ["目录", "CONTENTS", "目 录"])]
     number_shapes = [ts for ts in text_shapes if ts["font_size"] > 40 and ts not in title_shapes]
     small_shapes = [ts for ts in text_shapes if ts not in title_shapes and ts not in number_shapes]
 
-    # 小号文本框按位置从左到右、从上到下排序，填入章节名称
     toc_items = all_section_names if all_section_names else (data.bullet_items if data.bullet_items else [])
+
+    # 小号文本框按位置从左到右、从上到下排序
     small_sorted = sorted(small_shapes, key=lambda x: (x["left"], x["top"]))
-    toc_idx = 0
-    for ts in small_sorted:
-        if toc_idx < len(toc_items):
-            _set_shape_text(ts["shape"], toc_items[toc_idx])
-            toc_idx += 1
-        else:
-            _set_shape_text(ts["shape"], "")
+
+    # 如果章节数超过小号框数量，将多个章节名合并到一个框内（用换行分隔）
+    num_slots = len(small_sorted)
+    if num_slots > 0 and len(toc_items) > num_slots:
+        # 将toc_items均匀分配到各slot中
+        per_slot = math.ceil(len(toc_items) / num_slots)
+        for i, ts in enumerate(small_sorted):
+            start = i * per_slot
+            end = min(start + per_slot, len(toc_items))
+            if start < len(toc_items):
+                combined = "\n".join(toc_items[start:end])
+                _set_shape_text(ts["shape"], combined)
+            else:
+                _set_shape_text(ts["shape"], "")
+    else:
+        # 正常1对1填充
+        toc_idx = 0
+        for ts in small_sorted:
+            if toc_idx < len(toc_items):
+                _set_shape_text(ts["shape"], toc_items[toc_idx])
+                toc_idx += 1
+            else:
+                _set_shape_text(ts["shape"], "")
+
+    # 更新大号编号框的序号
+    number_sorted = sorted(number_shapes, key=lambda x: (x["left"], x["top"]))
+    for i, ts in enumerate(number_sorted):
+        _set_shape_text(ts["shape"], f"{i+1:02d}")
 
 
 def _replace_section_text(slide, data: SlideContent, theme: dict,
                            section_num: int):
-    """章节分隔页：最大→章节编号(01)，次大→'01 章节名'，保留'PART ONE'等"""
+    """章节分隔页：最大→章节编号(01)，次大→'01 章节名'，PART标签根据序号更新"""
     text_shapes = _collect_text_shapes(slide)
     sorted_shapes = sorted(text_shapes, key=lambda x: -x["font_size"])
 
     num_str = f"{section_num:02d}"
     clean_title = _clean_section_title(data.title)
     section_title = f"{num_str} {clean_title}"
+
+    # PART序号映射
+    part_names = {1: "ONE", 2: "TWO", 3: "THREE", 4: "FOUR", 5: "FIVE",
+                  6: "SIX", 7: "SEVEN", 8: "EIGHT", 9: "NINE", 10: "TEN"}
+    part_name = part_names.get(section_num, str(section_num))
 
     for i, ts in enumerate(sorted_shapes):
         if i == 0:
@@ -345,7 +483,7 @@ def _replace_section_text(slide, data: SlideContent, theme: dict,
             _set_shape_text(ts["shape"], section_title)
         else:
             if "part" in ts["text"].lower():
-                pass
+                _set_shape_text(ts["shape"], f"PART {part_name}")
             else:
                 _set_shape_text(ts["shape"], "")
 
