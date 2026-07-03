@@ -60,20 +60,24 @@ def parse_markdown(text: str) -> List[SlideContent]:
         # H1 → 封面页
         if line.startswith('# ') and not line.startswith('## '):
             title = _clean_text(line[2:].strip())
-            subtitle = ""
-            # 检查下一行是否为副标题
+            subtitle_lines = []
+            # 收集H1下面所有非空非标题行作为副标题（如姓名/学号/老师等）
             j = i + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            if j < len(lines) and not lines[j].startswith('#'):
-                # 下一行非空且非标题 → 作为副标题
-                next_line = _clean_text(lines[j].strip())
-                if len(next_line) < 60:  # 短文本视为副标题
-                    subtitle = next_line
+            while j < len(lines):
+                next_line = lines[j].strip()
+                if not next_line:
                     j += 1
-                i = j
-            else:
-                i += 1
+                    continue
+                if next_line.startswith('#'):
+                    break
+                # 短行视为副标题行
+                if len(next_line) < 80:
+                    subtitle_lines.append(_clean_text(next_line))
+                    j += 1
+                else:
+                    break
+            subtitle = "\n".join(subtitle_lines) if subtitle_lines else ""
+            i = j
             slides.append(SlideContent(
                 layout="title",
                 title=title,

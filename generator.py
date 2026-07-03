@@ -138,22 +138,24 @@ def _create_from_template(
     if not end_list:
         end_list = cover_list
 
-    # ── 步骤3: 收集所有章节名称 ──
+    # ── 步骤3: 收集所有章节名称，并清理"第X章"前缀 ──
     all_section_names = []
     section_num = 0
     for sd in slides:
         if sd.layout == "section":
             section_num += 1
-            all_section_names.append(sd.title)
+            all_section_names.append(_clean_section_title(sd.title))
         elif sd.layout == "content" and sd.level <= 1:
-            if not all_section_names or all_section_names[-1] != sd.title:
+            clean_title = _clean_section_title(sd.title)
+            if not all_section_names or all_section_names[-1] != clean_title:
                 section_num += 1
-                all_section_names.append(sd.title)
+                all_section_names.append(clean_title)
 
-    # ── 步骤4: 构建slide计划 ──
+    # ── 步骤4: 构建slide计划（自动插入目录页）──
     slide_plan = []  # [(type, data, tmpl_idx, section_num)]
     section_num = 0
     last_was_section = False
+    has_toc = False
 
     for sd in slides:
         layout = sd.layout
@@ -161,6 +163,7 @@ def _create_from_template(
             slide_plan.append(("cover", sd, cover_list[0]["index"], 0))
         elif layout == "toc":
             slide_plan.append(("toc", sd, toc_list[0]["index"] if toc_list else content_list[0]["index"], 0))
+            has_toc = True
         elif layout == "section":
             section_num += 1
             tmpl = section_list[(section_num - 1) % len(section_list)]
@@ -174,8 +177,16 @@ def _create_from_template(
                 section_sd = SlideContent(layout="section", title=sd.title, level=1)
                 tmpl = section_list[(section_num - 1) % len(section_list)]
                 slide_plan.append(("section", section_sd, tmpl["index"], section_num))
+                last_was_section = True
             slide_plan.append(("content", sd, content_list[0]["index"], section_num))
             last_was_section = False
+
+    # 自动在封面后插入目录页（如果模板有目录页且用户未显式提供目录）
+    if not has_toc and toc_list and len(slide_plan) > 0:
+        toc_sd = SlideContent(layout="toc", title="目录", level=0)
+        # 找到封面后的位置插入
+        insert_pos = 1  # 默认在封面后
+        slide_plan.insert(insert_pos, ("toc", toc_sd, toc_list[0]["index"], 0))
 
     # ── 步骤5: 创建新Presentation，按计划克隆模板slide ──
     new_prs = Presentation()
@@ -226,6 +237,16 @@ def _create_from_template(
 #  模板文本替换函数
 # ══════════════════════════════════════════════════════════════
 
+def _clean_section_title(title: str) -> str:
+    """清理章节标题：去除'第X章'前缀，只保留核心名称"""
+    import re
+    # 去除"第一章 ""第二章 "等中文序号前缀
+    cleaned = re.sub(r'^第[一二三四五六七八九十\d]+章\s*', '', title)
+    # 去除"Chapter 1 "等英文前缀
+    cleaned = re.sub(r'^[Cc]hapter\s*\d+\s*', '', cleaned)
+    return cleaned.strip() if cleaned.strip() else title
+
+
 def _collect_text_shapes(slide):
     """收集slide中所有有文本的shape信息（位置单位为英寸，与python-pptx内部一致）"""
     text_shapes = []
@@ -261,35 +282,50 @@ def _collect_text_shapes(slide):
 
 
 def _replace_cover_text(slide, data: SlideContent, theme: dict):
-    """封面页：最大文本→标题，其次→副标题，清空其余"""
+    """封面页：最大文本→标题，其余文本框按top位置填入副标题行，清空多余"""
     text_shapes = _collect_text_shapes(slide)
-    sorted_shapes = sorted(text_shapes, key=lambda x: -x["font_size"])
-    for i, ts in enumerate(sorted_shapes):
-        if i == 0:
-            _set_shape_text(ts["shape"], data.title)
-        elif i == 1:
-            _set_shape_text(ts["shape"], data.subtitle or "")
+    sorted_by_font = sorted(text_shapes, key=lambda x: -x["font_size"])
+
+    if not sorted_by_font:
+        return
+
+    # 最大→主标题
+    _set_shape_text(sorted_by_font[0]["shape"], data.title)
+
+    # 剩余文本框按top位置排序，依次填入副标题行
+    remaining = sorted_by_font[1:]
+    remaining_by_top = sorted(remaining, key=lambda x: x["top"])
+
+    # 将副标题按换行拆分
+    subtitle_lines = data.subtitle.split("\n") if data.subtitle else []
+
+    for i, ts in enumerate(remaining_by_top):
+        if i < len(subtitle_lines):
+            _set_shape_text(ts["shape"], subtitle_lines[i])
         else:
             _set_shape_text(ts["shape"], "")
 
 
 def _replace_toc_text(slide, data: SlideContent, theme: dict,
                        all_section_names: list):
-    """目录页：小号文本(22pt)→章节名称，大号编号和"目录"保留"""
+    """目录页：保留"目录"/"CONTENTS"和大号编号，小号文本框按位置填入章节名称"""
     text_shapes = _collect_text_shapes(slide)
-    sorted_shapes = sorted(text_shapes, key=lambda x: (x["font_size"] > 40, x["top"], x["left"]))
 
+    # 分三类：目录标题（含"目录"/"CONTENTS"）、大号编号（>40pt）、小号文本
+    title_shapes = [ts for ts in text_shapes if any(kw in ts["text"] for kw in ["目录", "CONTENTS", "目 录"])]
+    number_shapes = [ts for ts in text_shapes if ts["font_size"] > 40 and ts not in title_shapes]
+    small_shapes = [ts for ts in text_shapes if ts not in title_shapes and ts not in number_shapes]
+
+    # 小号文本框按位置从左到右、从上到下排序，填入章节名称
     toc_items = all_section_names if all_section_names else (data.bullet_items if data.bullet_items else [])
+    small_sorted = sorted(small_shapes, key=lambda x: (x["left"], x["top"]))
     toc_idx = 0
-    for ts in sorted_shapes:
-        if ts["font_size"] > 40:
-            continue
+    for ts in small_sorted:
+        if toc_idx < len(toc_items):
+            _set_shape_text(ts["shape"], toc_items[toc_idx])
+            toc_idx += 1
         else:
-            if toc_idx < len(toc_items):
-                _set_shape_text(ts["shape"], toc_items[toc_idx])
-                toc_idx += 1
-            else:
-                _set_shape_text(ts["shape"], "")
+            _set_shape_text(ts["shape"], "")
 
 
 def _replace_section_text(slide, data: SlideContent, theme: dict,
@@ -299,7 +335,8 @@ def _replace_section_text(slide, data: SlideContent, theme: dict,
     sorted_shapes = sorted(text_shapes, key=lambda x: -x["font_size"])
 
     num_str = f"{section_num:02d}"
-    section_title = f"{num_str} {data.title}"
+    clean_title = _clean_section_title(data.title)
+    section_title = f"{num_str} {clean_title}"
 
     for i, ts in enumerate(sorted_shapes):
         if i == 0:
