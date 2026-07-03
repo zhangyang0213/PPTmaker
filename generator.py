@@ -635,9 +635,10 @@ def _resolve_scheme_colors(slide, theme_colors: dict):
 
 
 def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
-    """复制模板slide到新演示文稿（包括背景、图片和形状）
+    """复制模板slide到新演示文稿（包括背景、layout形状、图片和形状）
     关键：将schemeClr(主题色引用)解析为srgbClr(显式RGB)，
     防止新PPT的主题色方案与模板不同导致颜色错乱。
+    同时复制layout上的shape（如正文页左侧红色矩形）。
     """
     import copy
 
@@ -675,7 +676,24 @@ def _clone_slide(prs: Presentation, source_slide, source_prs: Presentation):
             new_cSld.remove(new_bg)
         new_cSld.insert(0, copy.deepcopy(bg_to_copy))
 
-    # ── 复制所有shape（图片用add_picture，其余deepcopy XML）──
+    # ── 先复制layout上的shape（如正文页左侧红色矩形）──
+    try:
+        for shape in source_slide.slide_layout.shapes:
+            try:
+                img_blob = shape.image.blob
+                img_stream = BytesIO(img_blob)
+                new_slide.shapes.add_picture(
+                    img_stream, shape.left, shape.top, shape.width, shape.height
+                )
+                continue
+            except:
+                pass
+            el = copy.deepcopy(shape._element)
+            new_slide.shapes._spTree.append(el)
+    except Exception:
+        pass
+
+    # ── 再复制slide自身的shape（图片用add_picture，其余deepcopy XML）──
     for shape in source_slide.shapes:
         try:
             img_blob = shape.image.blob
